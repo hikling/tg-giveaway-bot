@@ -3,10 +3,6 @@ from __future__ import annotations
 from aiogram.filters.callback_data import CallbackData
 
 
-class LangCb(CallbackData, prefix="lang"):
-    code: str
-
-
 class JoinCb(CallbackData, prefix="join"):
     giveaway_id: int
 
@@ -25,3 +21,9 @@ class ClaimCb(CallbackData, prefix="claim"):
 
     giveaway_id: int
     tier_index: int
+
+
+class PoetryCb(CallbackData, prefix="poem"):
+    giveaway_id: int
+    nonce: str
+    choice: int

@@ -21,8 +21,7 @@ _env = Environment(
 
 def render(template_name: str, lang: str = "zh", **ctx: Any) -> str:
     candidates = [
-        f"{template_name}.{lang}.j2",
-        f"{template_name}.en.j2",
+        f"{template_name}.zh.j2",
         f"{template_name}.j2",
     ]
     seen: set[str] = set()

@@ -29,18 +29,15 @@ def _banner(settings) -> None:
     log.info("=" * 60)
     log.info(" tg-giveaway-bot starting")
     log.info(
-        " lang=%s tz=%s turnstile=%s db=%s",
+        " lang=%s tz=%s db=%s",
         settings.default_lang,
         settings.tz,
-        "on" if settings.turnstile_active else "off",
         settings.database_url.split("://", 1)[0],
     )
     log.info(
-        " gates: account_age=%s min_user_id=%s verify_rate=%s/min trust_xff=%s",
+        " gates: account_age=%s min_user_id=%s poetry_attempts=5",
         "on" if settings.account_age_gate else "off",
         settings.min_user_id or "(no filter)",
-        settings.verify_rate_per_minute or "off",
-        settings.trust_forwarded_for,
     )
     log.info(" admins=%s", settings.admin_ids or "(none)")
     # The webhook path embeds WEBHOOK_SECRET; logging the full URL would
@@ -89,18 +86,6 @@ async def main() -> None:
 
     scheduler = GiveawayScheduler(bot=bot, tz=settings.tz)
     dp["scheduler"] = scheduler
-
-    # The verification page builds t.me deep links, which need the bot's
-    # own username; fetch it once so /verify can offer a return button.
-    from bot.services import turnstile as ts
-
-    if settings.turnstile_active:
-        try:
-            me = await bot.get_me()
-            ts.set_bot_username(me.username)
-            log.info("turnstile active, bot=@%s", me.username)
-        except Exception:
-            log.exception("could not read bot username; verify links will omit the button")
 
     app = web.Application()
     app["bot"] = bot

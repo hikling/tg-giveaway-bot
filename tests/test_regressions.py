@@ -7,14 +7,11 @@ fakes. These cases are intentionally not executed during the static repair.
 from __future__ import annotations
 
 import asyncio
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.filters import CommandObject
-from aiohttp import web
 
 from bot.callbacks.factories import JoinCb
 from bot.db.models import GiveawayStatus
@@ -26,17 +23,13 @@ from bot.db.repo import (
     pending_notifications,
     replace_tier_winners,
 )
-from bot.db.turnstile_repo import consume_proof, has_valid_proof, issue_proof
 from bot.handlers import participate
 from bot.handlers.admin_create import build_admin_create_router
-from bot.handlers.start import build_start_router
 from bot.main import _configure_delivery
 from bot.services import giveaway as gw_service
-from bot.services import turnstile as ts
 from bot.services.channels import missing_channels, validate_channels
 from bot.services.notifier import retry_pending
 from bot.settings import Settings
-from bot.web import verify
 
 
 @pytest.mark.parametrize(
@@ -52,144 +45,6 @@ def test_admin_ids_from_environment(monkeypatch, value, expected):
     monkeypatch.setenv("ADMIN_IDS", value)
     settings = Settings(_env_file=None)
     assert settings.admin_ids == expected
-
-
-@pytest.fixture
-def captcha_settings(monkeypatch):
-    settings = Settings(
-        _env_file=None,
-        admin_ids=[],
-        turnstile_enabled=True,
-        turnstile_site_key='site"key',
-        turnstile_secret_key="test-secret",
-        public_base_url="https://giveaway.example.com",
-    )
-    monkeypatch.setattr(verify, "get_settings", lambda: settings)
-    monkeypatch.setattr(ts, "get_settings", lambda: settings)
-    monkeypatch.setattr(ts, "_bot_username", "giveaway_test_bot")
-    return settings
-
-
-def _request(gid, uid=1001, token="test-token"):
-    return SimpleNamespace(
-        match_info={"gid": str(gid)},
-        query={"uid": str(uid)},
-        remote="127.0.0.1",
-        post=AsyncMock(return_value={"cf-turnstile-response": token}),
-    )
-
-
-async def test_verification_form_can_submit(sessionmaker, new_giveaway, captcha_settings):
-    gid = await new_giveaway(turnstile_required=True)
-    response = await verify.verify_page(_request(gid))
-    assert response.content_type == "text/html"
-    assert response.text.count('class="cf-turnstile"') == 1
-    assert f'action="/verify/{gid}?uid=1001"' in response.text
-    assert 'method="post"' in response.text
-    assert 'type="submit"' in response.text
-    assert 'data-action="giveaway-join"' in response.text
-    assert 'data-sitekey="site&quot;key"' in response.text
-    assert "__SITE_KEY__" not in response.text
-
-
-async def test_verification_submit_issues_bound_proof(
-    sessionmaker,
-    new_giveaway,
-    captcha_settings,
-    monkeypatch,
-):
-    gid = await new_giveaway(turnstile_required=True)
-    cloudflare = AsyncMock(return_value=ts.SiteverifyResult(success=True))
-    monkeypatch.setattr(ts, "siteverify", cloudflare)
-    response = await verify.verify_submit(_request(gid))
-    assert response.status == 200
-    cloudflare.assert_awaited_once_with(
-        "test-token",
-        expected_action="giveaway-join",
-        expected_hostname="giveaway.example.com",
-    )
-    async with sessionmaker() as session:
-        assert await has_valid_proof(session, 1001, gid)
-        assert not await has_valid_proof(session, 1002, gid)
-    assert f"?start=verify_{gid}_" in response.text
-
-
-async def test_expired_giveaway_never_calls_cloudflare(
-    sessionmaker,
-    new_giveaway,
-    captcha_settings,
-    monkeypatch,
-):
-    gid = await new_giveaway(
-        turnstile_required=True,
-        end_at=datetime.now(timezone.utc) - timedelta(seconds=1),
-    )
-    cloudflare = AsyncMock()
-    monkeypatch.setattr(ts, "siteverify", cloudflare)
-    with pytest.raises(web.HTTPGone):
-        await verify.verify_submit(_request(gid))
-    cloudflare.assert_not_awaited()
-
-
-async def test_giveaway_ending_during_cloudflare_request_cannot_issue_proof(
-    sessionmaker,
-    new_giveaway,
-    captcha_settings,
-    monkeypatch,
-):
-    gid = await new_giveaway(turnstile_required=True)
-
-    async def cloudflare(*args, **kwargs):
-        await gw_service.cancel(gid)
-        return ts.SiteverifyResult(success=True)
-
-    monkeypatch.setattr(ts, "siteverify", cloudflare)
-    with pytest.raises(web.HTTPGone):
-        await verify.verify_submit(_request(gid))
-    async with sessionmaker() as session:
-        assert not await has_valid_proof(session, 1001, gid)
-
-
-async def test_missing_token_returns_a_retryable_form(
-    sessionmaker,
-    new_giveaway,
-    captcha_settings,
-):
-    gid = await new_giveaway(turnstile_required=True)
-    response = await verify.verify_submit(_request(gid, token=""))
-    assert response.status == 400
-    assert response.content_type == "text/html"
-    assert response.text.count('class="cf-turnstile"') == 1
-    assert 'method="post"' in response.text
-
-
-async def test_repeated_challenges_do_not_break_proof_consumption(sessionmaker, new_giveaway):
-    gid = await new_giveaway()
-    async with sessionmaker() as session:
-        first = await issue_proof(session, user_id=1001, giveaway_id=gid, token="first")
-        second = await issue_proof(session, user_id=1001, giveaway_id=gid, token="second")
-        await session.commit()
-    async with sessionmaker() as session:
-        assert await consume_proof(session, user_id=1001, giveaway_id=gid)
-        await session.commit()
-    async with sessionmaker() as session:
-        assert not await has_valid_proof(session, 1001, gid, nonce=first.nonce)
-        assert await has_valid_proof(session, 1001, gid, nonce=second.nonce)
-
-
-async def test_concurrent_spending_uses_a_proof_once(sessionmaker, new_giveaway):
-    gid = await new_giveaway()
-    async with sessionmaker() as session:
-        proof = await issue_proof(session, user_id=1001, giveaway_id=gid, token="token")
-        await session.commit()
-
-    async def spend():
-        async with sessionmaker() as session:
-            result = await consume_proof(session, user_id=1001, giveaway_id=gid, nonce=proof.nonce)
-            await session.commit()
-            return result
-
-    assert sorted(await asyncio.gather(spend(), spend())) == [False, True]
 
 
 async def test_concurrent_draws_produce_one_result(sessionmaker, new_giveaway, bot):
@@ -274,34 +129,6 @@ async def test_superseded_failed_winner_is_not_retried(sessionmaker, new_giveawa
     assert await retry_pending(bot, gid) == 0
 
 
-async def test_deep_link_returns_the_verified_user_to_join(
-    sessionmaker,
-    new_giveaway,
-    captcha_settings,
-):
-    gid = await new_giveaway(turnstile_required=True)
-    async with sessionmaker() as session:
-        proof = await issue_proof(session, user_id=1001, giveaway_id=gid, token="token")
-        await session.commit()
-    link = ts.deep_link(gid, proof.nonce)
-    payload = link.split("?start=", 1)[1]
-    assert len(payload) <= 64 and re.fullmatch(r"[A-Za-z0-9_-]+", payload)
-    on_start = next(
-        h.callback
-        for h in build_start_router().message.handlers
-        if h.callback.__name__ == "on_start"
-    )
-    message = SimpleNamespace(from_user=SimpleNamespace(id=1001, username="u"), answer=AsyncMock())
-    await on_start(message, CommandObject(command="start", args=payload))
-    markup = message.answer.await_args.kwargs["reply_markup"]
-    assert markup.inline_keyboard[0][0].callback_data.endswith(str(gid))
-    async with sessionmaker() as session:
-        assert await has_valid_proof(session, 1001, gid, nonce=proof.nonce)
-    other = SimpleNamespace(from_user=SimpleNamespace(id=1002, username="u2"), answer=AsyncMock())
-    await on_start(other, CommandObject(command="start", args=payload))
-    assert "reply_markup" not in other.answer.await_args.kwargs
-
-
 async def test_forwarded_channel_target_uses_current_telegram_fields(sessionmaker):
     handler = next(
         h.callback
@@ -313,7 +140,7 @@ async def test_forwarded_channel_target_uses_current_telegram_fields(sessionmake
         set_state=AsyncMock(),
         get_data=AsyncMock(
             return_value={
-                "end_at_iso": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                "end_at_iso": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "title": "Test",
                 "prizes": [{"name": "Key", "count": 1}],
                 "channels": [],
@@ -406,41 +233,13 @@ async def test_concurrent_join_creates_one_entry(sessionmaker, new_giveaway, bot
         handler(second, JoinCb(giveaway_id=gid)),
     )
     async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1
+        assert await count_participants(session, gid) == 0
+        from bot.db.models import PoetryAttempt
+
+        assert (await session.get(PoetryAttempt, (gid, 1001))).wrong_count == 0
     assert sorted(
         [
             first.answer.await_args.kwargs["show_alert"],
             second.answer.await_args.kwargs["show_alert"],
         ]
-    ) == [False, True]
-
-
-@pytest.mark.parametrize(
-    "data,expected",
-    [
-        ({"success": True, "action": "giveaway-join", "hostname": "giveaway.example.com"}, True),
-        ({"success": True, "hostname": "giveaway.example.com"}, False),
-        ({"success": True, "action": "giveaway-join"}, False),
-        ({"success": True, "action": "other", "hostname": "giveaway.example.com"}, False),
-        ({"success": True, "action": "giveaway-join", "hostname": "other.example.com"}, False),
-    ],
-)
-async def test_cloudflare_action_and_hostname_are_required(
-    captcha_settings,
-    monkeypatch,
-    data,
-    expected,
-):
-    response = AsyncMock()
-    response.__aenter__.return_value = response
-    response.json.return_value = data
-    http = AsyncMock()
-    http.__aenter__.return_value = http
-    http.post = Mock(return_value=response)
-    monkeypatch.setattr(ts.aiohttp, "ClientSession", lambda **kwargs: http)
-    result = await ts.siteverify(
-        "token",
-        expected_action="giveaway-join",
-        expected_hostname="giveaway.example.com",
-    )
-    assert result.success is expected
+    ) == [False, False]

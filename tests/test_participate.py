@@ -7,7 +7,7 @@ membership, and the single-use Turnstile proof.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from bot.callbacks.factories import JoinCb
 from bot.db.models import GiveawayStatus
@@ -16,7 +16,6 @@ from bot.db.repo import (
     count_participants,
     update_giveaway_status,
 )
-from bot.db.turnstile_repo import has_valid_proof, issue_proof
 from bot.handlers.participate import build_participate_router
 
 
@@ -48,7 +47,7 @@ def _on_join():
 ON_JOIN = _on_join()
 
 
-async def test_join_creates_an_entry(sessionmaker, new_giveaway, bot):
+async def test_join_sends_question_without_entering(sessionmaker, new_giveaway, bot):
     gid = await new_giveaway()
     cq = FakeCallbackQuery(1001, gid, bot)
 
@@ -56,12 +55,10 @@ async def test_join_creates_an_entry(sessionmaker, new_giveaway, bot):
 
     assert cq.answers[-1][1] is False, "success is a quiet toast, not an alert"
     async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1
+        assert await count_participants(session, gid) == 0
 
 
-async def test_double_tap_reports_already_and_keeps_one_entry(
-    sessionmaker, new_giveaway, bot
-):
+async def test_double_tap_reports_already_and_keeps_one_entry(sessionmaker, new_giveaway, bot):
     """P1-1: the second tap must not claim success."""
     gid = await new_giveaway()
 
@@ -70,14 +67,12 @@ async def test_double_tap_reports_already_and_keeps_one_entry(
         await ON_JOIN(cq, cq.data)
 
     async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1
-    assert cq.answers[-1][1] is True, "a duplicate must not report success"
+        assert await count_participants(session, gid) == 0
+    assert cq.answers[-1][1] is False, "pending question is resent without consuming a chance"
 
 
 async def test_expired_giveaway_is_refused(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway(
-        end_at=datetime.now(timezone.utc) - timedelta(minutes=1)
-    )
+    gid = await new_giveaway(end_at=datetime.now(UTC) - timedelta(minutes=1))
     cq = FakeCallbackQuery(1001, gid, bot)
 
     await ON_JOIN(cq, cq.data)
@@ -132,7 +127,7 @@ async def test_joining_after_subscribing_succeeds(sessionmaker, new_giveaway, bo
     await ON_JOIN(cq, cq.data)
 
     async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1
+        assert await count_participants(session, gid) == 0
 
 
 async def test_channel_check_fails_closed_when_the_bot_cannot_read_it(
@@ -148,39 +143,3 @@ async def test_channel_check_fails_closed_when_the_bot_cannot_read_it(
 
     async with sessionmaker() as session:
         assert await count_participants(session, gid) == 0
-
-
-async def test_turnstile_blocks_without_a_proof(sessionmaker, new_giveaway, bot):
-    """P0-2: the captcha is no longer a shield emoji in a template."""
-    gid = await new_giveaway(turnstile_required=True)
-
-    cq = FakeCallbackQuery(1001, gid, bot)
-    await ON_JOIN(cq, cq.data)
-
-    async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 0
-    assert cq.last[1] is True
-
-
-async def test_a_valid_proof_admits_exactly_one_entry(
-    sessionmaker, new_giveaway, bot
-):
-    gid = await new_giveaway(turnstile_required=True)
-    async with sessionmaker() as session:
-        await issue_proof(session, user_id=1001, giveaway_id=gid, token="tok")
-        await session.commit()
-
-    cq = FakeCallbackQuery(1001, gid, bot)
-    await ON_JOIN(cq, cq.data)
-
-    async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1
-        # The proof was SPENT by the join, not merely checked.
-        assert await has_valid_proof(session, 1001, gid) is False
-
-    # A second tap now lands on the already-entered branch, not on verify.
-    cq2 = FakeCallbackQuery(1001, gid, bot)
-    await ON_JOIN(cq2, cq2.data)
-
-    async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1

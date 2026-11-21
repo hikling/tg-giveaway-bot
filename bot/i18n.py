@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 import yaml
@@ -15,7 +14,7 @@ LOCALES_DIR = PROJECT_ROOT / "locales"
 
 _translations: dict[str, dict[str, str]] = {}
 _default_lang: str = "zh"
-_fallback_lang: str = "en"
+_fallback_lang: str = "zh"
 
 
 def _flatten(prefix: str, data: Any, out: dict[str, str]) -> None:
@@ -31,12 +30,12 @@ def _flatten(prefix: str, data: Any, out: dict[str, str]) -> None:
 
 def load_locales(default_lang: str = "zh") -> None:
     global _default_lang, _translations
-    _default_lang = default_lang
+    _default_lang = "zh"
     _translations = {}
     if not LOCALES_DIR.exists():
         log.warning("locales dir missing: %s", LOCALES_DIR)
         return
-    for yml in sorted(LOCALES_DIR.glob("*.yaml")):
+    for yml in [LOCALES_DIR / "zh.yaml"]:
         lang = yml.stem
         try:
             raw = yaml.safe_load(yml.read_text(encoding="utf-8")) or {}
@@ -67,7 +66,13 @@ def _warn_missing_keys() -> None:
         if missing:
             log.warning("locale %s is missing %d key(s): %s", lang, len(missing), missing)
         if extra:
-            log.warning("locale %s has %d key(s) absent from %s: %s", lang, len(extra), _fallback_lang, extra)
+            log.warning(
+                "locale %s has %d key(s) absent from %s: %s",
+                lang,
+                len(extra),
+                _fallback_lang,
+                extra,
+            )
 
 
 def available_langs() -> list[str]:
@@ -81,7 +86,7 @@ def missing_key_report() -> dict[str, list[str]]:
     for lang, table in _translations.items():
         if lang == _fallback_lang:
             continue
-        out[lang] = sorted((set(base) ^ set(table)))
+        out[lang] = sorted(set(base) ^ set(table))
     return out
 
 
@@ -91,7 +96,7 @@ def t(key: str, lang: str | None = None, **kwargs: Any) -> str:
     Values wrapped in ``Raw()`` are inserted verbatim; everything else is
     escaped, which is what made title/description injection safe.
     """
-    chosen = lang or _default_lang
+    chosen = "zh"
     table = _translations.get(chosen) or {}
     template = table.get(key)
     if template is None:

@@ -1,42 +1,23 @@
-# Deployment / 部署
+# 部署
 
-Two ways to run this bot. Both need a `.env` in the repository root.
+## 普通服务器
 
-## A. Local / VPS without Docker
+按项目根目录 README 创建虚拟环境、安装依赖并填写 `.env`，执行 `python -m bot`。长轮询只需服务器能够连接 Telegram，不需要域名或验证码网页。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy/setup.ps1   # venv + deps + .env
-# edit .env, then:
-.venv\Scripts\python.exe -m bot
-```
+## Docker 和 HTTPS
 
-On Linux/macOS the equivalent is:
+在项目根目录复制 `.env.example` 为 `.env` 并填写必要项，再执行：
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env && $EDITOR .env
-python -m bot
-```
-
-Long polling needs no public address. The captcha page does: set
-`PUBLIC_BASE_URL` to a URL that reaches this machine (see below).
-
-## B. Docker + automatic HTTPS
-
-```bash
-cp .env.example .env && $EDITOR .env      # WEBHOOK_BASE_URL=https://<DOMAIN>
 DOMAIN=giveaway.example.com docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-No domain? Use a wildcard-DNS name for your public IP: `DOMAIN=1.2.3.4.nip.io`,
-and set `WEBHOOK_BASE_URL` / `PUBLIC_BASE_URL` to `https://1.2.3.4.nip.io`.
+此方式会启动 Caddy 并占用 80、443 端口，须将域名指向服务器。若使用 Webhook，设置 `WEBHOOK_BASE_URL=https://giveaway.example.com` 和 `WEBHOOK_SECRET`。数据库持久化在项目根目录 `data/`，更新前请停止服务并备份该目录及 `.env`。
 
-Caddy terminates TLS and proxies to the bot on port 8080.
+更新后执行同一条构建启动命令；查看日志：
 
-## Publishing your own copy
-
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy/publish-to-github.ps1 -CheckOnly
-powershell -ExecutionPolicy Bypass -File deploy/publish-to-github.ps1
+```bash
+docker compose -f deploy/docker-compose.yml logs -f bot
 ```
+
+古诗词答题全部在机器人私聊内进行，无需配置 Cloudflare。
