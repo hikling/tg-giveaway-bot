@@ -1,8 +1,4 @@
-"""Anti-abuse primitives used by the live bot.
-
-The three checks here are all *enabled by default* and wired into the request
-path; `hardening/checks.py` re-exports them for the standalone test suite.
-"""
+"""附加用户编号门槛、限速工具与可验证开奖工具。"""
 from __future__ import annotations
 
 import hashlib
@@ -14,12 +10,7 @@ from dataclasses import dataclass, field
 
 # --------------------------------------------------------------- account age
 def account_age_gate(user_id: int, min_user_id: int) -> bool:
-    """True when the account is old enough to take part.
-
-    Telegram allocates user IDs in ascending order, so user_id >= min_user_id is
-    a cheap proxy for "registered after date X" that a bot farm cannot fake.
-    min_user_id <= 0 disables the numeric part of the filter.
-    """
+    """附加的用户编号下限；不将其解释为可靠的账号注册年龄。"""
     if min_user_id <= 0:
         return True
     return int(user_id) >= int(min_user_id)

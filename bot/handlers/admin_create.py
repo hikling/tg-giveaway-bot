@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram import Bot, Router
 from aiogram.filters import Command, StateFilter
@@ -34,7 +34,6 @@ class GiveawayDraft(StatesGroup):
     waiting_prizes = State()
     waiting_channels = State()
     waiting_duration = State()
-    waiting_turnstile = State()
     waiting_prizemode = State()
     waiting_codes = State()
     waiting_target = State()
@@ -127,25 +126,10 @@ def build_admin_create_router() -> Router:
         lang = await lang_of(message.from_user.id)
         tz = get_settings().tz
         end_at = parse_end_at(message.text or "", tz)
-        if end_at is None or end_at <= datetime.now(timezone.utc):
+        if end_at is None or end_at <= datetime.now(UTC):
             await message.answer(t("fsm.bad_duration", lang))
             return
         await state.update_data(end_at_iso=end_at.isoformat())
-        await state.set_state(GiveawayDraft.waiting_turnstile)
-        await message.answer(t("fsm.enter_turnstile", lang))
-
-    @router.message(GiveawayDraft.waiting_turnstile)
-    async def step_turnstile(message: Message, state: FSMContext) -> None:
-        lang = await lang_of(message.from_user.id)
-        text = (message.text or "").strip().lower()
-        turn = text in {"yes", "y", "1", "true", "on", "是", "开"}
-        if turn and not get_settings().turnstile_capable():
-            # Used to be stored blindly: the post advertised a shield and
-            # participation hardcoded verified=True, so the promise was a
-            # lie. Also PUBLIC_BASE_URL is required to build the verify link.
-            await message.answer(t("admin.turnstile_not_configured", lang))
-            return
-        await state.update_data(turnstile=turn)
         await state.set_state(GiveawayDraft.waiting_prizemode)
         await message.answer(t("fsm.enter_prizemode", lang))
 
@@ -261,7 +245,6 @@ def build_admin_create_router() -> Router:
                 prizes=prizes_lines,
                 channels=channels_text,
                 ends_at=format_local(end_at, get_settings().tz),
-                turnstile=("on" if data.get("turnstile") else "off"),
                 prizemode=t(f"fsm.mode_{data.get('prize_mode', 'none')}", lang),
                 target=target_label,
             )
@@ -276,7 +259,7 @@ def build_admin_create_router() -> Router:
     ) -> None:
         lang = await lang_of(message.from_user.id)
         text = (message.text or "").strip().lower()
-        if text != "ok":
+        if text not in {"确认", "ok"}:
             await message.answer(t("common.cancel", lang))
             await state.clear()
             return
@@ -285,7 +268,7 @@ def build_admin_create_router() -> Router:
         end_at = datetime.fromisoformat(data["end_at_iso"])
         tz_name = get_settings().tz
         target_chat_id = int(data["target_chat_id"])
-        if end_at <= datetime.now(timezone.utc):
+        if end_at <= datetime.now(UTC):
             await state.set_state(GiveawayDraft.waiting_duration)
             await message.answer(t("fsm.bad_duration", lang))
             return
@@ -298,7 +281,7 @@ def build_admin_create_router() -> Router:
             prize_tiers=data["prizes"],
             required_channels=data["channels"],
             end_at=end_at,
-            turnstile_required=bool(data.get("turnstile")),
+            turnstile_required=False,
             prize_mode=mode,
         )
 
@@ -329,7 +312,6 @@ def build_admin_create_router() -> Router:
             channels=gw.required_channels,
             ends_at=format_local(gw.end_at, tz_name),
             count=count,
-            turnstile=gw.turnstile_required,
             commit=gw.draw_commit,
         )
 

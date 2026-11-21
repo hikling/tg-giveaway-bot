@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
-    Index,
-)
-from sqlalchemy import Enum as SAEnum
-from sqlalchemy import (
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from bot.db.base import Base
@@ -25,7 +23,7 @@ from bot.db.types import UTCDateTime
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class GiveawayStatus(str, enum.Enum):
@@ -76,10 +74,10 @@ class Giveaway(Base):
     draw_commit: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_utcnow)
 
-    participants: Mapped[list["Participant"]] = relationship(
+    participants: Mapped[list[Participant]] = relationship(
         back_populates="giveaway", cascade="all, delete-orphan"
     )
-    winners: Mapped[list["WinnerLog"]] = relationship(
+    winners: Mapped[list[WinnerLog]] = relationship(
         back_populates="giveaway", cascade="all, delete-orphan"
     )
 
@@ -130,9 +128,7 @@ class WinnerLog(Base):
 
     giveaway: Mapped[Giveaway] = relationship(back_populates="winners")
 
-    __table_args__ = (
-        Index("ix_winner_logs_current", "giveaway_id", "tier_name", "replaced_at"),
-    )
+    __table_args__ = (Index("ix_winner_logs_current", "giveaway_id", "tier_name", "replaced_at"),)
 
 
 class PrizeCode(Base):
@@ -143,9 +139,7 @@ class PrizeCode(Base):
     """
 
     __tablename__ = "prize_codes"
-    __table_args__ = (
-        Index("ix_prize_codes_stock", "giveaway_id", "tier_name", "claimed_count"),
-    )
+    __table_args__ = (Index("ix_prize_codes_stock", "giveaway_id", "tier_name", "claimed_count"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     giveaway_id: Mapped[int] = mapped_column(
@@ -163,9 +157,7 @@ class PrizeClaim(Base):
 
     __tablename__ = "prize_claims"
     __table_args__ = (
-        UniqueConstraint(
-            "giveaway_id", "user_id", "tier_name", name="uq_prize_claim_gw_user_tier"
-        ),
+        UniqueConstraint("giveaway_id", "user_id", "tier_name", name="uq_prize_claim_gw_user_tier"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -188,28 +180,6 @@ class AdminUser(Base):
     added_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_utcnow)
 
 
-class TurnstileProof(Base):
-    """A short-lived, single-use proof that one user solved the captcha.
-
-    Cloudflare tokens are single-use, so this table mostly exists to (a) bind
-    a solved challenge to a concrete giveaway and user, (b) make the window
-    short, and (c) survive a Cloudflare hiccup without letting a token be
-    spent twice.  Only the token's SHA-256 is stored.
-    """
-
-    __tablename__ = "turnstile_proofs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    giveaway_id: Mapped[int] = mapped_column(ForeignKey("giveaways.id", ondelete="CASCADE"), index=True)
-    nonce: Mapped[str] = mapped_column(String(64), unique=True)
-    token_hash: Mapped[str] = mapped_column(String(64))
-    remote_ip: Mapped[str | None] = mapped_column(String(45))
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_utcnow)
-    expires_at: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
-    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
-
-
 class Blacklist(Base):
     __tablename__ = "blacklist"
 
@@ -217,3 +187,27 @@ class Blacklist(Base):
     reason: Mapped[str | None] = mapped_column(String(512))
     banned_by: Mapped[int | None] = mapped_column(BigInteger)
     banned_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_utcnow)
+
+
+class PoetryAttempt(Base):
+    """一人一场独立计错；当前题目、选项及一次性凭据均持久化。"""
+
+    __tablename__ = "poetry_attempts"
+
+    giveaway_id: Mapped[int] = mapped_column(
+        ForeignKey("giveaways.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    wrong_count: Mapped[int] = mapped_column(Integer, default=0)
+    question_id: Mapped[int] = mapped_column(Integer)
+    options: Mapped[list[str]] = mapped_column(JSON)
+    nonce: Mapped[str | None] = mapped_column(String(32))
+
+
+class PoetryRotation(Base):
+    """跨抽奖轮换，50题用完后开启新一轮。"""
+
+    __tablename__ = "poetry_rotations"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    used_ids: Mapped[list[int]] = mapped_column(JSON, default=list)

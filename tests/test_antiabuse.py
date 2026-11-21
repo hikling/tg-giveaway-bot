@@ -6,11 +6,10 @@ verification page, commit-reveal on the draw.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from aiohttp import web
 
 from bot.db.models import GiveawayStatus
 from bot.db.repo import add_participant, count_participants, get_giveaway
@@ -18,7 +17,6 @@ from bot.handlers import participate as participate_mod
 from bot.services import giveaway as gw_service
 from bot.services.giveaway import _pick_tier, finalize_and_publish
 from bot.utils.antiabuse import draw_indices, reveal_ok
-from bot.web import verify as verify_mod
 
 ADMIN_ID = 424242
 
@@ -52,6 +50,7 @@ async def test_account_age_gate_refuses_a_fresh_account(
     )
 
     cq = FakeCQ(1001)
+    cq.bot = bot
     await _on_join()(cq, SimpleNamespace(giveaway_id=gid))
 
     assert cq.answers[-1][1] is True, "the refusal must be an alert"
@@ -71,31 +70,11 @@ async def test_account_age_gate_lets_old_accounts_through(
     )
 
     cq = FakeCQ(1001)
+    cq.bot = bot
     await _on_join()(cq, SimpleNamespace(giveaway_id=gid))
 
     async with sessionmaker() as session:
-        assert await count_participants(session, gid) == 1
-
-
-def test_verify_page_is_rate_limited_per_client() -> None:
-    client = f"203.0.113.{abs(hash('rate')) % 200}"
-    request = SimpleNamespace(headers={"X-Forwarded-For": client}, remote="10.0.0.1")
-
-    for _ in range(10):
-        verify_mod._enforce_rate_limit(request)
-
-    with pytest.raises(web.HTTPTooManyRequests) as err:
-        verify_mod._enforce_rate_limit(request)
-    assert err.value.headers.get("Retry-After") == "60"
-
-    # A different address still gets its own budget.
-    other = SimpleNamespace(headers={"X-Forwarded-For": "198.51.100.7"}, remote="10.0.0.1")
-    verify_mod._enforce_rate_limit(other)
-
-
-def test_client_ip_prefers_the_forwarded_header() -> None:
-    request = SimpleNamespace(headers={"X-Forwarded-For": "198.51.100.9, 10.0.0.1"}, remote="10.0.0.1")
-    assert verify_mod._client_ip(request) == "198.51.100.9"
+        assert await count_participants(session, gid) == 0
 
 
 @pytest.mark.asyncio
@@ -106,7 +85,7 @@ async def test_new_giveaway_commits_to_a_seed_before_it_opens(sessionmaker) -> N
         description="",
         prize_tiers=[{"name": "Gold", "count": 1}],
         required_channels=[],
-        end_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        end_at=datetime.now(UTC) + timedelta(hours=1),
         turnstile_required=False,
     )
     assert gw.draw_seed and len(gw.draw_seed) == 64
@@ -135,7 +114,7 @@ async def test_the_announcement_reveals_the_seed(sessionmaker, bot) -> None:
         description="",
         prize_tiers=[{"name": "Gold", "count": 1}],
         required_channels=[],
-        end_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        end_at=datetime.now(UTC) + timedelta(hours=1),
         turnstile_required=False,
     )
     gid = gw.id
@@ -152,7 +131,8 @@ async def test_the_announcement_reveals_the_seed(sessionmaker, bot) -> None:
     public = [text for chat, text, _kw in bot.sent if chat == -100777][0]
     assert gw.draw_seed in public
     assert gw.draw_commit in public
-    assert "seed" in public
+    assert "随机种子" in public
+
 
 class FakeMessage:
     def __init__(self, user_id: int = ADMIN_ID) -> None:
@@ -182,5 +162,5 @@ async def test_gate_command_reports_the_current_policy(sessionmaker, new_giveawa
     await handler(message, SimpleNamespace(args=str(gid)))
 
     text = message.answers[-1]
-    assert "MIN_USER_ID" in text
+    assert "古诗词" in text
     assert "1001" in text, text

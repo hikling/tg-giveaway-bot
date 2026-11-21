@@ -13,35 +13,38 @@ from bot.i18n import available_langs, load_locales, missing_key_report, t
 from bot.utils.esc import Raw, esc, esc_list, user_mention
 
 
-def test_every_locale_has_the_same_keys():
+def test_only_chinese_locale_is_loaded():
     """A key present in one language and missing in another is a runtime 500."""
     # en is the fallback table, so it is the baseline rather than a report row.
     report = missing_key_report()
-    assert "en" in available_langs() and "zh" in available_langs()
+    assert available_langs() == ["zh"]
     assert set(report) <= {"zh"}
     for lang, keys in report.items():
         assert keys == [], f"{lang} key drift: {keys}"
 
 
-def test_available_langs_includes_both_languages():
+def test_available_langs_is_chinese_only():
     langs = available_langs()
-    assert "en" in langs and "zh" in langs
+    assert langs == ["zh"]
 
 
 def test_title_with_an_ampersand_is_escaped():
     out = t("winner_dm.body", "en", title="R&D key", tier="Gold", creator="boss")
     assert "R&amp;D" in out
-    assert "<" not in out.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
+    assert "<" not in out.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace(
+        "</i>", ""
+    )
 
 
 def test_escaping_is_applied_to_every_placeholder():
-    out = t("admin.list_row", "en", id=1, title="<script>", status="running",
-           ends_at="soon", count=0)
+    out = t(
+        "admin.list_row", "en", id=1, title="<script>", status="running", ends_at="soon", count=0
+    )
     assert "&lt;script&gt;" in out
     assert "<script>" not in out
 
 
-def test_known_keys_are_present_in_both_languages():
+def test_old_language_codes_resolve_to_known_chinese_keys():
     for key in ("start.welcome", "join.ok", "giveaway.winner_line", "fsm.confirm"):
         for lang in ("en", "zh"):
             assert t(key, lang) != key, f"{key} missing in {lang}"
@@ -85,3 +88,13 @@ def test_load_locales_is_idempotent():
     load_locales("zh")
     load_locales("zh")
     assert t("start.welcome", "en")
+
+
+def test_old_language_preferences_always_get_chinese():
+    assert t("start.welcome", "en") == t("start.welcome", "zh")
+    assert t("start.welcome", "unknown") == t("start.welcome", "zh")
+
+
+def test_chinese_help_does_not_contain_unsupported_html_placeholder_tags():
+    assert "<" not in t("start.help")
+    assert "<" not in t("admin.usage_reroll")

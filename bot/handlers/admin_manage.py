@@ -168,9 +168,8 @@ def build_admin_manage_router() -> Router:
             t(
                 "admin.gate_header",
                 lang,
-                gate=("on" if settings.account_age_gate else "off"),
+                gate=("开启" if settings.account_age_gate else "关闭"),
                 min_user_id=settings.min_user_id,
-                rate=settings.verify_rate_per_minute,
             )
         ]
         gid = _int_arg(command.args or "")
@@ -180,7 +179,9 @@ def build_admin_manage_router() -> Router:
                 people = await list_participants(session, gid, verified_only=True)
             ids = sorted(p.user_id for p in people)
             if ids:
-                below = sum(1 for i in ids if i < settings.min_user_id) if settings.min_user_id else 0
+                below = (
+                    sum(1 for i in ids if i < settings.min_user_id) if settings.min_user_id else 0
+                )
                 lines.append(
                     t(
                         "admin.gate_dist",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 from pydantic import Field, field_validator, model_validator
@@ -33,32 +33,12 @@ class Settings(BaseSettings):
     # enforced only in webhook mode (see the model validator below).
     webhook_secret: str = ""
 
-    default_lang: str = "zh"
+    default_lang: Literal["zh"] = "zh"
     tz: str = "Asia/Shanghai"
 
-    turnstile_enabled: bool = False
-    turnstile_site_key: str = ""
-    turnstile_secret_key: str = ""
-    # Public origin used to build the verification link handed to users.  When
-    # empty the bot falls back to WEBHOOK_BASE_URL; if that is empty too, a
-    # captcha-gated giveaway is refused at creation time rather than producing
-    # a link nobody can open.
-    public_base_url: str = ""
-
-    # --- anti-abuse gates -------------------------------------------------
-    # Telegram hands out user IDs in ascending order, so an ID threshold is a
-    # cheap "account is older than X" filter that no captcha can fake.  0 means
-    # "gate armed but no numeric filtering"; /gate shows the current policy and
-    # the ID spread of a giveaway so a threshold can be picked without guessing.
+    # 可选用户编号下限；不能可靠代表注册年龄。默认0不过滤。
     account_age_gate: bool = True
     min_user_id: int = 0
-    # Per-IP budget for the verification page (GET and POST).  0 disables it.
-    verify_rate_per_minute: int = 10
-    # The Docker/Caddy deployment puts a reverse proxy in front, so the client
-    # address arrives in X-Forwarded-For.  Turn this off if the bot is exposed
-    # directly and you do not want the header trusted.
-    trust_forwarded_for: bool = True
-
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
     log_level: str = "INFO"
@@ -66,6 +46,11 @@ class Settings(BaseSettings):
     # updates after each deploy - including the giveaway post an admin had
     # literally just created.  Off by default; opt in when you are certain.
     drop_pending_updates: bool = False
+
+    @field_validator("default_lang", mode="before")
+    @classmethod
+    def _chinese_only(cls, v):
+        return "zh"
 
     @field_validator("admin_ids", mode="before")
     @classmethod
@@ -76,13 +61,13 @@ class Settings(BaseSettings):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
         return v
 
-    @field_validator("webhook_base_url", "public_base_url")
+    @field_validator("webhook_base_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
 
     @model_validator(mode="after")
-    def _webhook_requires_secret(self) -> "Settings":
+    def _webhook_requires_secret(self) -> Settings:
         if self.webhook_base_url and len(self.webhook_secret) < 8:
             raise ValueError(
                 "WEBHOOK_SECRET must be set to at least 8 characters when "
@@ -95,11 +80,6 @@ class Settings(BaseSettings):
         return bool(self.webhook_base_url)
 
     @property
-    def public_origin(self) -> str:
-        """Origin a participant can actually reach, for building links."""
-        return self.public_base_url or self.webhook_base_url
-
-    @property
     def webhook_path(self) -> str:
         return f"/tg/{quote(self.webhook_secret or 'unset', safe='')}"
 
@@ -108,22 +88,6 @@ class Settings(BaseSettings):
         if not self.webhook_base_url:
             return ""
         return f"{self.webhook_base_url}{self.webhook_path}"
-
-    @property
-    def turnstile_active(self) -> bool:
-        return (
-            self.turnstile_enabled
-            and bool(self.turnstile_site_key)
-            and bool(self.turnstile_secret_key)
-        )
-
-    def turnstile_capable(self) -> bool:
-        """True when a captcha-gated giveaway could actually be completed."""
-        return self.turnstile_active and bool(self.public_origin)
-
-    def verify_url(self, giveaway_id: int, user_id: int) -> str:
-        """Challenge URL handed to a participant."""
-        return f"{self.public_origin}/verify/{giveaway_id}?uid={int(user_id)}"
 
     def masked_webhook_url(self) -> str:
         """Webhook URL safe for logs - the secret is a bearer credential."""
