@@ -75,6 +75,12 @@ class GiveawayScheduler:
         from bot.services.poetry import expire_due_questions
 
         for gw in running:
+            if gw.publishing:
+                from bot.services.publication import publish_all
+
+                result = await publish_all(self._bot, gw.id)
+                if result.canceled:
+                    continue
             self.schedule(gw.id, gw.end_at, gw.draw_mode)
             if gw.draw_mode in {"count", "either"}:
                 await restore_count_draw(gw.id, self._bot)

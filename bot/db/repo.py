@@ -155,6 +155,7 @@ async def create_giveaway(
     required_groups: list[str] | None = None,
     draw_mode: str = "time",
     target_participants: int | None = None,
+    publishing: bool = False,
 ) -> Giveaway:
     gw = Giveaway(
         creator_id=creator_id,
@@ -165,6 +166,7 @@ async def create_giveaway(
         required_groups=required_groups or [],
         draw_mode=draw_mode,
         target_participants=target_participants,
+        publishing=publishing,
         end_at=end_at,
         turnstile_required=turnstile_required,
         prize_mode=prize_mode,
@@ -235,7 +237,10 @@ async def claim_giveaway(
     """
     stmt = update(Giveaway).where(Giveaway.id == giveaway_id, Giveaway.status == expected_status)
     if require_open:
-        stmt = stmt.where(or_(Giveaway.draw_mode == "count", Giveaway.end_at > _now()))
+        stmt = stmt.where(
+            or_(Giveaway.draw_mode == "count", Giveaway.end_at > _now()),
+            Giveaway.publishing.is_(False),
+        )
     stmt = stmt.values(
         status=new_status if new_status is not None else Giveaway.status
     ).execution_options(synchronize_session=False)

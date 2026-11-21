@@ -19,7 +19,7 @@ from bot.db.models import GiveawayStatus
 from bot.db.repo import claim_giveaway, ensure_user, get_giveaway, has_participated, is_blacklisted
 from bot.i18n import t
 from bot.poetry import POEMS
-from bot.services.channels import missing_channels
+from bot.services.channels import display_requirement, linked_requirements, missing_channels
 from bot.services.giveaway import draw_if_full, publish_draw
 from bot.services.poetry import Challenge, answer, get_challenge, record_delivery
 from bot.settings import get_settings
@@ -68,6 +68,9 @@ async def _eligible(cq: CallbackQuery, gid: int) -> bool:
         ):
             await cq.answer(t("join.ended"), show_alert=True)
             return False
+        if gw.publishing:
+            await cq.answer(t("join.publishing"), show_alert=True)
+            return False
         if await is_blacklisted(session, uid):
             await cq.answer(t("join.banned"), show_alert=True)
             return False
@@ -78,13 +81,17 @@ async def _eligible(cq: CallbackQuery, gid: int) -> bool:
     if channels:
         missing = await missing_channels(cq.bot, uid, channels)
         if missing:
-            notice = t("join.not_member", channels="\n".join(missing))
-            if len(notice) <= 190:
+            notice = t(
+                "join.not_member", channels="\n".join(display_requirement(raw) for raw in missing)
+            )
+            if len(notice) <= 190 and not any("|" in raw for raw in missing):
                 await cq.answer(notice, show_alert=True)
             else:
                 # Telegram回调弹窗最多200字符；完整要求发私聊，避免多群组时按钮报错。
                 try:
-                    await cq.bot.send_message(uid, notice)
+                    await cq.bot.send_message(
+                        uid, t("join.not_member", channels=linked_requirements(missing))
+                    )
                     summary = "请先加入必加频道和群组，完整清单已发送到私聊。"
                 except TelegramAPIError:
                     summary = "请先私聊机器人发送 /start，再点击参加查看完整的必加频道和群组清单。"
@@ -161,11 +168,15 @@ def build_participate_router() -> Router:
             draw = await draw_if_full(session, gid) if result == "ok" else None
             await session.commit()
         try:
-            if result == "wrong":
+            if result in {"wrong", "replaced"}:
                 # 先提交计错，再发下一题；发送失败后可点参加恢复同一道题。
                 if await _send_question(cq, challenge):
                     await cq.answer(
-                        t("poetry.wrong", remaining=challenge.remaining), show_alert=True
+                        t(
+                            "poetry.replaced" if result == "replaced" else "poetry.wrong",
+                            remaining=challenge.remaining,
+                        ),
+                        show_alert=True,
                     )
             else:
                 key = {
@@ -186,6 +197,7 @@ def build_participate_router() -> Router:
                                 "already": "join.already",
                                 "locked": "poetry.locked",
                                 "wrong": "poetry.previous_wrong",
+                                "replaced": "poetry.replaced",
                                 "timeout": "poetry.timeout",
                             }[result]
                         )

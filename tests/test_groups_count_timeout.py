@@ -39,7 +39,8 @@ async def test_both_channel_and_group_are_required(sessionmaker, new_giveaway, b
     bot.set_member("@news", 1001, "member")
     challenge, query = await begin(bot, gid)
     assert challenge is None
-    assert "-100123" in query.answer.await_args.args[0]
+    assert "完整清单" in query.answer.await_args.args[0]
+    assert "-100123" in bot.sent[-1][1]
     bot.set_member("-100123", 1001, "member")
     challenge, _ = await begin(bot, gid)
     assert challenge is not None
@@ -450,16 +451,15 @@ async def test_creator_sets_channel_group_and_count_condition_then_publishes(ses
         )
 
     await state.update_data(title="中文抽奖", description="", prizes=[{"name": "奖品", "count": 1}])
-    await handlers["step_channels"](message("@news"), state, bot)
+    await handlers["step_channels"](message("官方频道 | https://t.me/news"), state, bot)
     assert await state.get_state() == GiveawayDraft.waiting_groups.state
-    await handlers["step_groups"](message("-100222 | https://t.me/+invite"), state, bot)
+    await handlers["step_groups"](message("交流群 | https://t.me/+invite | -100222"), state, bot)
     assert await state.get_state() == GiveawayDraft.waiting_duration.state
     await handlers["step_duration"](message("满100人"), state)
     data = await state.get_data()
     assert data["draw_mode"] == "count" and data["target_participants"] == 100
-    await handlers["step_prizemode"](message("0"), state)
-    confirm = message("@news")
-    await handlers["step_target"](confirm, state, bot)
+    confirm = message("0")
+    await handlers["step_prizemode"](confirm, state)
     summary = confirm.answer.await_args.args[0]
     assert "必加群组" in summary and "满 100 人" in summary and "9999" not in summary
     scheduler = SimpleNamespace(schedule=Mock())
@@ -467,8 +467,8 @@ async def test_creator_sets_channel_group_and_count_condition_then_publishes(ses
     async with sessionmaker() as session:
         games = await list_running_giveaways(session)
         assert len(games) == 1
-        assert games[0].required_channels == ["@news"]
-        assert games[0].required_groups == ["-100222|https://t.me/+invite"]
+        assert games[0].required_channels == ["@news|https://t.me/news|官方频道"]
+        assert games[0].required_groups == ["-100222|https://t.me/+invite|交流群"]
         assert games[0].draw_mode == "count" and games[0].target_participants == 100
     post = bot.sent[-1][1]
     assert "必加群组" in post and "满 100 人" in post and "60秒" in post

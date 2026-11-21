@@ -222,6 +222,28 @@ def build_admin_manage_router() -> Router:
         key = "admin.ban_ok" if removed else "admin.ban_ok_none"
         await message.answer(t(key, lang, user_id=uid, n=removed))
 
+    @router.message(Command("republish"))
+    async def on_republish(message: Message, command: CommandObject, bot: Bot) -> None:
+        from bot.services.publication import publish_all
+
+        gid = _int_arg(command.args or "")
+        if gid is None:
+            await message.answer("用法：/republish 〈抽奖编号〉")
+            return
+        try:
+            result = await publish_all(bot, gid)
+        except ValueError:
+            await message.answer("抽奖不存在、已结束或已取消，无法补发。")
+            return
+        await message.answer(
+            t(
+                "fsm.publish_partial",
+                id=gid,
+                sent=result.sent,
+                names="、".join(result.failed) or "无",
+            )
+        )
+
     @router.message(Command("retry"))
     async def on_retry(message: Message, command: CommandObject, bot: Bot) -> None:
         lang = await lang_of(message.from_user.id)

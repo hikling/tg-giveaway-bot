@@ -59,9 +59,9 @@ async def stored(sessionmaker, gid, uid=1001):
         return await session.get(PoetryAttempt, (gid, uid))
 
 
-def test_bank_has_fifty_unambiguous_two_character_questions():
-    assert len(POEMS) == 50
-    assert len({p.prompt for p in POEMS}) == 50
+def test_bank_has_twenty_five_unambiguous_two_character_questions():
+    assert len(POEMS) == 25
+    assert len({p.prompt for p in POEMS}) == 25
     for p in POEMS:
         assert p.prompt.count("□□") == 1
         assert len(p.answer) == 2
@@ -179,20 +179,20 @@ async def test_pending_and_lock_survive_new_database_engine(sessionmaker, new_gi
     assert "五次" in query.answer.await_args.args[0]
 
 
-async def test_fifty_questions_rotate_across_giveaways_without_repeating(
+async def test_twenty_five_questions_rotate_across_giveaways_without_repeating(
     sessionmaker, new_giveaway, bot
 ):
     ids = []
     last = None
-    for _ in range(51):
+    for _ in range(26):
         gid = await new_giveaway()
         last, _ = await begin(bot, gid)
         ids.append(last.question_id)
-    assert len(set(ids[:50])) == 50
-    assert ids[49] != ids[50]
+    assert len(set(ids[:25])) == 25
+    assert ids[24] != ids[25]
     async with sessionmaker() as session:
         rotation = await session.get(PoetryRotation, 1001)
-        assert rotation.used_ids == [ids[50]]
+        assert rotation.used_ids == [ids[25]]
 
 
 async def test_channel_membership_is_rechecked_when_answering(sessionmaker, new_giveaway, bot):

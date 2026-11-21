@@ -9,20 +9,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
-from bot.db.base import get_sessionmaker
-from bot.db.repo import count_participants
 from bot.filters.admin import IsAdmin
 from bot.handlers.common import lang_of
 from bot.i18n import t
 from bot.keyboards.admin import admin_giveaway_panel
-from bot.keyboards.participate import participate_keyboard
 from bot.services import giveaway as gw_service
 from bot.services import prize as prize_service
-from bot.services.channels import display_requirement, validate_channels
+from bot.services.channels import linked_requirements, resolve_destinations, validate_channels
+from bot.services.publication import publish_all
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
 from bot.utils.esc import esc_list
-from bot.utils.render import render
 from bot.utils.timeparse import (
     format_draw_condition,
     parse_channels,
@@ -42,18 +39,39 @@ class GiveawayDraft(StatesGroup):
     waiting_duration = State()
     waiting_prizemode = State()
     waiting_codes = State()
-    waiting_target = State()
     waiting_confirm = State()
 
 
+async def _show_confirmation(message: Message, state: FSMContext, lang: str) -> None:
+    data = await state.get_data()
+    end_at = datetime.fromisoformat(data["end_at_iso"])
+    await state.set_state(GiveawayDraft.waiting_confirm)
+    await message.answer(
+        t(
+            "fsm.confirm",
+            lang,
+            title=data.get("title", ""),
+            prizes="\n".join(f"• {p['name']} × {p['count']}" for p in data.get("prizes", [])),
+            channels=linked_requirements(data.get("channels", [])),
+            groups=linked_requirements(data.get("groups", [])),
+            ends_at=format_draw_condition(
+                end_at,
+                data.get("draw_mode", "time"),
+                data.get("target_participants"),
+                get_settings().tz,
+            ),
+            prizemode=t(f"fsm.mode_{data.get('prize_mode', 'none')}", lang),
+        )
+    )
+
+
 async def _ask_codes(message: Message, state: FSMContext, lang: str) -> None:
-    """Ask for the stock of the next tier, or move on to the target step."""
+    """逐档录入奖品，完成后直接显示发布确认。"""
     data = await state.get_data()
     tiers = list(data.get("prizes") or [])
     index = int(data.get("codes_index", 0))
     if index >= len(tiers):
-        await state.set_state(GiveawayDraft.waiting_target)
-        await message.answer(t("fsm.enter_target", lang))
+        await _show_confirmation(message, state, lang)
         return
     tier = tiers[index]
     if data.get("prize_mode") == "shared":
@@ -143,6 +161,10 @@ def build_admin_create_router() -> Router:
         if missing:
             await message.answer(t("fsm.bad_groups", lang, groups=esc_list(missing)))
             return
+        data = await state.get_data()
+        if not groups and not data.get("channels"):
+            await message.answer(t("fsm.no_destinations", lang))
+            return
         await state.update_data(groups=groups)
         await state.set_state(GiveawayDraft.waiting_duration)
         await message.answer(t("fsm.enter_duration", lang))
@@ -177,8 +199,7 @@ def build_admin_create_router() -> Router:
             return
         await state.update_data(prize_mode=mode, codes_index=0, codes_buffer=[])
         if mode == "none":
-            await state.set_state(GiveawayDraft.waiting_target)
-            await message.answer(t("fsm.enter_target", lang))
+            await _show_confirmation(message, state, lang)
             return
         await state.set_state(GiveawayDraft.waiting_codes)
         await _ask_codes(message, state, lang)
@@ -190,8 +211,7 @@ def build_admin_create_router() -> Router:
         tiers = list(data.get("prizes") or [])
         index = int(data.get("codes_index", 0))
         if index >= len(tiers):
-            await state.set_state(GiveawayDraft.waiting_target)
-            await message.answer(t("fsm.enter_target", lang))
+            await _show_confirmation(message, state, lang)
             return
 
         tier = tiers[index]
@@ -222,73 +242,7 @@ def build_admin_create_router() -> Router:
         if index + 1 < len(tiers):
             await _ask_codes(message, state, lang)
             return
-        await state.set_state(GiveawayDraft.waiting_target)
-        await message.answer(t("fsm.enter_target", lang))
-
-    @router.message(GiveawayDraft.waiting_target)
-    async def step_target(message: Message, state: FSMContext, bot: Bot) -> None:
-        lang = await lang_of(message.from_user.id)
-
-        target_chat_id: int | None = None
-        target_label: str | None = None
-
-        origin = message.forward_origin
-        forwarded_chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
-        if forwarded_chat is not None:
-            target_chat_id = forwarded_chat.id
-            target_label = forwarded_chat.title or forwarded_chat.username or str(target_chat_id)
-        else:
-            text = (message.text or "").strip()
-            ref: str | int | None = None
-            if text.startswith("@"):
-                ref = text
-            else:
-                try:
-                    ref = int(text)
-                except ValueError:
-                    ref = None
-            if ref is not None:
-                try:
-                    chat = await bot.get_chat(ref)
-                    target_chat_id = chat.id
-                    target_label = chat.title or chat.username or str(chat.id)
-                except Exception:
-                    log.warning("get_chat failed for %r", ref)
-
-        if target_chat_id is None:
-            await message.answer(t("fsm.bad_target", lang))
-            return
-
-        await state.update_data(target_chat_id=target_chat_id, target_label=target_label)
-
-        data = await state.get_data()
-        end_at = datetime.fromisoformat(data["end_at_iso"])
-        prizes_lines = "\n".join(f"• {p['name']} × {p['count']}" for p in data["prizes"])
-        channels_text = (
-            "\n".join(display_requirement(x) for x in data["channels"])
-            if data["channels"]
-            else "无"
-        )
-        groups_text = "\n".join(display_requirement(x) for x in data.get("groups", [])) or "无"
-        await state.set_state(GiveawayDraft.waiting_confirm)
-        await message.answer(
-            t(
-                "fsm.confirm",
-                lang,
-                title=data["title"],
-                prizes=prizes_lines,
-                channels=channels_text,
-                groups=groups_text,
-                ends_at=format_draw_condition(
-                    end_at,
-                    data.get("draw_mode", "time"),
-                    data.get("target_participants"),
-                    get_settings().tz,
-                ),
-                prizemode=t(f"fsm.mode_{data.get('prize_mode', 'none')}", lang),
-                target=target_label,
-            )
-        )
+        await _show_confirmation(message, state, lang)
 
     @router.message(GiveawayDraft.waiting_confirm)
     async def step_confirm(
@@ -306,11 +260,28 @@ def build_admin_create_router() -> Router:
 
         data = await state.get_data()
         end_at = datetime.fromisoformat(data["end_at_iso"])
-        tz_name = get_settings().tz
-        target_chat_id = int(data["target_chat_id"])
         if data.get("draw_mode", "time") != "count" and end_at <= datetime.now(UTC):
             await state.set_state(GiveawayDraft.waiting_duration)
             await message.answer(t("fsm.bad_duration", lang))
+            return
+
+        requirements = [*data["channels"], *data.get("groups", [])]
+        if not requirements:
+            await state.set_state(GiveawayDraft.waiting_channels)
+            await message.answer(t("fsm.no_destinations", lang))
+            return
+        # 发布前重新检查权限并解析真实编号，相同目标的用户名/编号只发布一次。
+        try:
+            problems = [
+                *await validate_channels(bot, data["channels"], expected_type="channel"),
+                *await validate_channels(bot, data.get("groups", []), expected_type="group"),
+            ]
+            targets = await resolve_destinations(bot, requirements)
+        except Exception:
+            await message.answer(t("fsm.publish_check_failed", lang))
+            return
+        if problems:
+            await message.answer(t("fsm.publish_check_failed", lang) + "\n" + esc_list(problems))
             return
 
         mode = str(data.get("prize_mode") or "none")
@@ -326,6 +297,8 @@ def build_admin_create_router() -> Router:
             end_at=end_at,
             turnstile_required=False,
             prize_mode=mode,
+            publishing=True,
+            destinations=[(target.chat_id, target.name) for target in targets],
         )
 
         # Stock is filled before the post goes out, so a winner never presses
@@ -341,42 +314,22 @@ def build_admin_create_router() -> Router:
             except Exception:
                 log.exception("add_codes failed: giveaway=%s tier=%s", gw.id, tier_name)
 
-        sm = get_sessionmaker()
-        async with sm() as session:
-            count = await count_participants(session, gw.id, verified_only=True)
-
-        post_text = render(
-            "giveaway_running",
-            lang,
-            id=gw.id,
-            title=gw.title,
-            description=gw.description,
-            prizes=gw.prize_tiers,
-            channels=[display_requirement(x) for x in gw.required_channels],
-            groups=[display_requirement(x) for x in gw.required_groups],
-            ends_at=format_draw_condition(gw.end_at, gw.draw_mode, gw.target_participants, tz_name),
-            count=count,
-            commit=gw.draw_commit,
-        )
-
-        try:
-            sent = await bot.send_message(
-                target_chat_id,
-                post_text,
-                reply_markup=participate_keyboard(gw.id, lang),
-            )
-        except Exception:
-            log.exception("send giveaway post failed: chat_id=%s", target_chat_id)
-            # The row is already committed; leaving it "running" with no
-            # message and no scheduled draw produces a giveaway that can
-            # never be joined and never fires.
-            await gw_service.cancel(gw.id)
-            await message.answer(t("common.unknown_error", lang))
+        result = await publish_all(bot, gw.id)
+        if result.canceled:
+            await message.answer(t("fsm.publish_all_failed", lang))
             await state.clear()
             return
-
-        await gw_service.attach_message(gw.id, sent.chat.id, sent.message_id)
         scheduler.schedule(gw.id, gw.end_at, gw.draw_mode)
+        if result.failed:
+            await message.answer(
+                t(
+                    "fsm.publish_partial",
+                    lang,
+                    id=gw.id,
+                    sent=result.sent,
+                    names="、".join(result.failed),
+                )
+            )
 
         # Admin controls stay in the admin chat on purpose: the public post
         # only carries the join button.

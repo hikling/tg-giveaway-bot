@@ -6,10 +6,12 @@ which the service-level tests already cover.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot.handlers.admin_create import GiveawayDraft, build_admin_create_router
 from tests.conftest import ADMIN_ID
@@ -40,8 +42,13 @@ def _ctx() -> FSMContext:
 
 
 @pytest.mark.asyncio
-async def test_unique_codes_are_collected_then_target_is_asked(sessionmaker) -> None:
+async def test_unique_codes_are_collected_then_confirmation_is_shown(sessionmaker) -> None:
     fsm = _ctx()
+    await fsm.update_data(
+        end_at_iso=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        channels=["@news"],
+        groups=[],
+    )
     await fsm.set_state(GiveawayDraft.waiting_prizemode)
     await fsm.update_data(prizes=[{"name": "Steam card", "count": 2}])
 
@@ -60,12 +67,17 @@ async def test_unique_codes_are_collected_then_target_is_asked(sessionmaker) -> 
 
     data = await fsm.get_data()
     assert data["codes_buffer"] == [["Steam card", ["AAA-1", "BBB-2"]]]
-    assert await fsm.get_state() == GiveawayDraft.waiting_target.state
+    assert await fsm.get_state() == GiveawayDraft.waiting_confirm.state
 
 
 @pytest.mark.asyncio
 async def test_shared_text_keeps_its_newlines(sessionmaker) -> None:
     fsm = _ctx()
+    await fsm.update_data(
+        end_at_iso=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        channels=["@news"],
+        groups=[],
+    )
     await fsm.set_state(GiveawayDraft.waiting_prizemode)
     await fsm.update_data(prizes=[{"name": "Steam card", "count": 1}])
 
@@ -81,6 +93,11 @@ async def test_shared_text_keeps_its_newlines(sessionmaker) -> None:
 @pytest.mark.asyncio
 async def test_manual_mode_skips_the_codes_step(sessionmaker) -> None:
     fsm = _ctx()
+    await fsm.update_data(
+        end_at_iso=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        channels=["@news"],
+        groups=[],
+    )
     await fsm.set_state(GiveawayDraft.waiting_prizemode)
     await fsm.update_data(prizes=[{"name": "Steam card", "count": 1}])
 
@@ -88,12 +105,17 @@ async def test_manual_mode_skips_the_codes_step(sessionmaker) -> None:
     await _handler("step_prizemode")(message, fsm)
 
     assert (await fsm.get_data())["prize_mode"] == "none"
-    assert await fsm.get_state() == GiveawayDraft.waiting_target.state
+    assert await fsm.get_state() == GiveawayDraft.waiting_confirm.state
 
 
 @pytest.mark.asyncio
 async def test_a_short_batch_warns_but_still_moves_on(sessionmaker) -> None:
     fsm = _ctx()
+    await fsm.update_data(
+        end_at_iso=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        channels=["@news"],
+        groups=[],
+    )
     await fsm.set_state(GiveawayDraft.waiting_codes)
     await fsm.update_data(
         prizes=[{"name": "Steam card", "count": 3}],
