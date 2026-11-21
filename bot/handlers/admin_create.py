@@ -3,23 +3,31 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
+from bot.callbacks.factories import PrizeDraftCb
 from bot.filters.admin import IsAdmin
 from bot.handlers.common import lang_of
 from bot.i18n import t
 from bot.keyboards.admin import admin_giveaway_panel
 from bot.services import giveaway as gw_service
-from bot.services import prize as prize_service
 from bot.services.channels import linked_requirements, resolve_destinations, validate_channels
 from bot.services.publication import publish_all
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
-from bot.utils.esc import esc_list
+from bot.utils.esc import Raw, esc_list
+from bot.utils.prize_input import (
+    ACCEPT_TEXTS,
+    RESET_TEXTS,
+    parse_input,
+    review_controls,
+    serialize_draft,
+    valid_action,
+)
 from bot.utils.timeparse import (
     format_draw_condition,
     parse_channels,
@@ -39,6 +47,7 @@ class GiveawayDraft(StatesGroup):
     waiting_duration = State()
     waiting_prizemode = State()
     waiting_codes = State()
+    waiting_codes_review = State()
     waiting_confirm = State()
 
 
@@ -46,6 +55,12 @@ async def _show_confirmation(message: Message, state: FSMContext, lang: str) -> 
     data = await state.get_data()
     end_at = datetime.fromisoformat(data["end_at_iso"])
     await state.set_state(GiveawayDraft.waiting_confirm)
+    owner = data.get("prize_draft_owner", message.from_user.id)
+    controls = (
+        await review_controls(state, owner, "new", accept=False)
+        if data.get("prize_mode") != "none"
+        else None
+    )
     await message.answer(
         t(
             "fsm.confirm",
@@ -61,7 +76,9 @@ async def _show_confirmation(message: Message, state: FSMContext, lang: str) -> 
                 get_settings().tz,
             ),
             prizemode=t(f"fsm.mode_{data.get('prize_mode', 'none')}", lang),
-        )
+            inventory=_inventory_summary(data, lang),
+        ),
+        reply_markup=controls,
     )
 
 
@@ -73,13 +90,91 @@ async def _ask_codes(message: Message, state: FSMContext, lang: str) -> None:
     if index >= len(tiers):
         await _show_confirmation(message, state, lang)
         return
+    await state.set_state(GiveawayDraft.waiting_codes)
+    # 进入下一档使前一档的旧按钮立即失效。
+    owner = data.get("prize_draft_owner", message.from_user.id)
+    controls = await review_controls(state, owner, "new", accept=False)
     tier = tiers[index]
     if data.get("prize_mode") == "shared":
-        await message.answer(t("fsm.enter_codes_shared", lang, tier=tier["name"]))
+        await message.answer(
+            t("fsm.enter_codes_shared", lang, tier=tier["name"]), reply_markup=controls
+        )
     else:
         await message.answer(
-            t("fsm.enter_codes_unique", lang, tier=tier["name"], count=tier["count"])
+            t("fsm.enter_codes_unique", lang, tier=tier["name"], count=tier["count"]),
+            reply_markup=controls,
         )
+
+
+def _inventory_summary(data: dict, lang: str) -> str:
+    if data.get("prize_mode") == "none":
+        return t("fsm.inventory_manual", lang)
+    counts = {name: len(codes) for name, codes in data.get("codes_buffer", [])}
+    lines = [t("fsm.inventory_total", lang, count=sum(counts.values()))]
+    for tier in data.get("prizes", []):
+        lines.append(
+            t(
+                "fsm.inventory_row",
+                lang,
+                tier=tier["name"],
+                count=counts.get(tier["name"], 0),
+                needed=tier["count"],
+            )
+        )
+    return Raw("\n".join(lines))
+
+
+async def _reset_all_codes(message: Message, state: FSMContext, lang: str) -> None:
+    if (await state.get_data()).get("prize_mode") == "none":
+        await message.answer(t("fsm.inventory_manual", lang))
+        await _show_confirmation(message, state, lang)
+        return
+    await state.update_data(
+        codes_buffer=[], codes_pending=[], codes_index=0, prize_review_token=None
+    )
+    await message.answer(t("fsm.codes_reset", lang))
+    await _ask_codes(message, state, lang)
+
+
+async def _review_codes(message: Message, state: FSMContext, lang: str) -> None:
+    data = await state.get_data()
+    tier = data["prizes"][int(data["codes_index"])]
+    count, needed = len(data.get("codes_pending", [])), int(tier["count"])
+    difference = (
+        f"少 {needed - count} 条"
+        if count < needed
+        else f"多 {count - needed} 条"
+        if count > needed
+        else "数量一致"
+    )
+    owner = data.get("prize_draft_owner", message.from_user.id)
+    controls = await review_controls(state, owner, "new")
+    await state.set_state(GiveawayDraft.waiting_codes_review)
+    await message.answer(
+        t(
+            "fsm.codes_review_shared" if data.get("prize_mode") == "shared" else "fsm.codes_review",
+            lang,
+            tier=tier["name"],
+            count=count,
+            needed=needed,
+            difference=difference,
+            total=sum(len(codes) for _, codes in data.get("codes_buffer", [])) + count,
+        ),
+        reply_markup=controls,
+    )
+
+
+async def _accept_codes(message: Message, state: FSMContext, lang: str) -> None:
+    data = await state.get_data()
+    index = int(data["codes_index"])
+    tier = data["prizes"][index]
+    buffer = list(data.get("codes_buffer", []))
+    # 当前档只写入一次；重复按钮会被新的凭据和状态拒绝。
+    buffer.append([str(tier["name"]), list(data.get("codes_pending", []))])
+    await state.update_data(
+        codes_buffer=buffer, codes_pending=[], codes_index=index + 1, prize_review_token=None
+    )
+    await _ask_codes(message, state, lang)
 
 
 def build_admin_create_router() -> Router:
@@ -87,14 +182,17 @@ def build_admin_create_router() -> Router:
     router.message.filter(IsAdmin())
 
     @router.message(Command("cancel"), StateFilter(GiveawayDraft))
+    @serialize_draft
     async def on_cancel(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(t("common.cancel", await lang_of(message.from_user.id)))
 
     @router.message(Command("newgiveaway"))
+    @serialize_draft
     async def on_new(message: Message, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
         await state.clear()
+        await state.update_data(prize_draft_owner=message.from_user.id)
         await state.set_state(GiveawayDraft.waiting_title)
         await message.answer(t("fsm.enter_title", lang))
 
@@ -122,7 +220,11 @@ def build_admin_create_router() -> Router:
     async def step_prizes(message: Message, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
         prizes = parse_prizes(message.text or "")
-        if not prizes:
+        if (
+            not prizes
+            or len({p["name"] for p in prizes}) != len(prizes)
+            or any(len(p["name"]) > 64 for p in prizes)
+        ):
             await message.answer(t("fsm.bad_prizes", lang))
             return
         await state.update_data(prizes=prizes)
@@ -185,6 +287,7 @@ def build_admin_create_router() -> Router:
         await message.answer(t("fsm.enter_prizemode", lang))
 
     @router.message(GiveawayDraft.waiting_prizemode)
+    @serialize_draft
     async def step_prizemode(message: Message, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
         text = (message.text or "").strip().lower()
@@ -197,65 +300,89 @@ def build_admin_create_router() -> Router:
         else:
             await message.answer(t("fsm.bad_prizemode", lang))
             return
-        await state.update_data(prize_mode=mode, codes_index=0, codes_buffer=[])
+        await state.update_data(
+            prize_mode=mode,
+            codes_index=0,
+            codes_buffer=[],
+            codes_pending=[],
+            prize_draft_owner=message.from_user.id,
+        )
         if mode == "none":
             await _show_confirmation(message, state, lang)
             return
         await state.set_state(GiveawayDraft.waiting_codes)
         await _ask_codes(message, state, lang)
 
-    @router.message(GiveawayDraft.waiting_codes)
+    @router.message(StateFilter(GiveawayDraft.waiting_codes, GiveawayDraft.waiting_codes_review))
+    @serialize_draft
     async def step_codes(message: Message, state: FSMContext) -> None:
+        current = await state.get_state()
+        if current not in {
+            GiveawayDraft.waiting_codes.state,
+            GiveawayDraft.waiting_codes_review.state,
+        }:
+            return
         lang = await lang_of(message.from_user.id)
-        data = await state.get_data()
-        tiers = list(data.get("prizes") or [])
-        index = int(data.get("codes_index", 0))
-        if index >= len(tiers):
-            await _show_confirmation(message, state, lang)
-            return
-
-        tier = tiers[index]
-        mode = data.get("prize_mode") or "unique"
         raw = (message.text or "").strip()
-        if raw == "-":
-            codes: list[str] = []
-        elif mode == "shared":
-            # The whole message is the prize text: newlines are meaningful.
-            codes = [raw]
-        else:
-            codes = [line.strip() for line in raw.splitlines() if line.strip()]
-            if not codes:
-                await message.answer(t("fsm.bad_codes", lang))
-                return
-
-        needed = int(tier.get("count") or 0)
-        if mode == "unique" and codes and len(codes) < needed:
-            # Fewer codes than winners is legal - the host can top up with
-            # /addcodes before the draw - but it must not be a silent surprise.
-            await message.answer(t("fsm.codes_short", lang, count=len(codes), needed=needed))
-
-        buffer = list(data.get("codes_buffer") or [])
-        if codes:
-            buffer.append([str(tier["name"]), codes])
-        await state.update_data(codes_buffer=buffer, codes_index=index + 1)
-
-        if index + 1 < len(tiers):
-            await _ask_codes(message, state, lang)
+        if raw in RESET_TEXTS:
+            await _reset_all_codes(message, state, lang)
             return
-        await _show_confirmation(message, state, lang)
+        if current == GiveawayDraft.waiting_codes_review.state and raw.lower() in ACCEPT_TEXTS:
+            await _accept_codes(message, state, lang)
+            return
+        if not raw:
+            await message.answer(t("fsm.bad_codes", lang))
+            return
+        data = await state.get_data()
+        codes = parse_input(raw, data.get("prize_mode", "unique"), data.get("codes_pending", []))
+        await state.update_data(codes_pending=codes, prize_draft_owner=message.from_user.id)
+        await _review_codes(message, state, lang)
+
+    @router.callback_query(PrizeDraftCb.filter(F.scope == "new"))
+    @serialize_draft
+    async def on_codes_action(
+        cq: CallbackQuery, callback_data: PrizeDraftCb, state: FSMContext
+    ) -> None:
+        if not await IsAdmin()(cq):
+            await cq.answer(t("common.not_admin"), show_alert=True)
+            return
+        current = await state.get_state()
+        if not await valid_action(state, cq.from_user.id, callback_data) or current not in {
+            GiveawayDraft.waiting_codes.state,
+            GiveawayDraft.waiting_codes_review.state,
+            GiveawayDraft.waiting_confirm.state,
+        }:
+            await cq.answer(t("prize.draft_stale"), show_alert=True)
+            return
+        if callback_data.action == "accept" and current != GiveawayDraft.waiting_codes_review.state:
+            await cq.answer(t("prize.draft_stale"), show_alert=True)
+            return
+        if cq.message is None:
+            await cq.answer(t("prize.draft_stale"), show_alert=True)
+            return
+        if callback_data.action == "reset":
+            await _reset_all_codes(cq.message, state, "zh")
+        else:
+            await _accept_codes(cq.message, state, "zh")
+        await cq.answer()
 
     @router.message(GiveawayDraft.waiting_confirm)
+    @serialize_draft
     async def step_confirm(
         message: Message,
         state: FSMContext,
         bot: Bot,
         scheduler: GiveawayScheduler,
     ) -> None:
+        if await state.get_state() != GiveawayDraft.waiting_confirm.state:
+            return
         lang = await lang_of(message.from_user.id)
-        text = (message.text or "").strip().lower()
-        if text not in {"确认", "ok"}:
-            await message.answer(t("common.cancel", lang))
-            await state.clear()
+        text = (message.text or "").strip()
+        if text in RESET_TEXTS:
+            await _reset_all_codes(message, state, lang)
+            return
+        if text.lower() not in {"确认", "ok"}:
+            await message.answer(t("fsm.confirm_hint", lang))
             return
 
         data = await state.get_data()
@@ -285,34 +412,29 @@ def build_admin_create_router() -> Router:
             return
 
         mode = str(data.get("prize_mode") or "none")
-        gw = await gw_service.create(
-            creator_id=message.from_user.id,
-            title=data["title"],
-            description=data["description"],
-            prize_tiers=data["prizes"],
-            required_channels=data["channels"],
-            required_groups=data.get("groups", []),
-            draw_mode=data.get("draw_mode", "time"),
-            target_participants=data.get("target_participants"),
-            end_at=end_at,
-            turnstile_required=False,
-            prize_mode=mode,
-            publishing=True,
-            destinations=[(target.chat_id, target.name) for target in targets],
-        )
-
-        # Stock is filled before the post goes out, so a winner never presses
-        # a claim button that has nothing behind it yet.
-        max_claims = prize_service.max_claims_for(mode)
-        for tier_name, codes in data.get("codes_buffer") or []:
-            if not codes:
-                continue
-            try:
-                await prize_service.add_codes(
-                    gw.id, str(tier_name), list(codes), max_claims=max_claims
-                )
-            except Exception:
-                log.exception("add_codes failed: giveaway=%s tier=%s", gw.id, tier_name)
+        try:
+            gw = await gw_service.create(
+                creator_id=message.from_user.id,
+                title=data["title"],
+                description=data["description"],
+                prize_tiers=data["prizes"],
+                required_channels=data["channels"],
+                required_groups=data.get("groups", []),
+                draw_mode=data.get("draw_mode", "time"),
+                target_participants=data.get("target_participants"),
+                end_at=end_at,
+                turnstile_required=False,
+                prize_mode=mode,
+                publishing=True,
+                initial_codes=[
+                    (str(name), list(codes)) for name, codes in data.get("codes_buffer", [])
+                ],
+                destinations=[(target.chat_id, target.name) for target in targets],
+            )
+        except Exception as exc:
+            log.error("抽奖与奖品事务保存失败：%s", type(exc).__name__)
+            await message.answer(t("fsm.stock_save_failed", lang))
+            return
 
         result = await publish_all(bot, gw.id)
         if result.canceled:

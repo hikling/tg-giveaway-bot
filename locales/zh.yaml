@@ -140,12 +140,23 @@ prize:
   stock_empty: '抽奖 #{id} 还没有录入任何奖品。'
   status_usage: 用法:/prizestatus 〈抽奖编号〉
   addcodes_usage: 用法:/addcodes 〈抽奖编号〉 〈奖项名〉
-  addcodes_prompt: '请把「{tier}」的奖品一行一条发给我,发送 - 结束录入。
+  addcodes_prompt: '请把「{tier}」本次要补充的奖品发来，系统会先统计数量供你核对，确认后才会入库。
 
-    '
+    独立码每行一条，可分多条消息粘贴；共享文本整段算一份。
+
+    可点「全部删除并重新添加」清空本次待确认内容；发送 - 或 /cancel 放弃本次录入。'
   addcodes_ok: ✅ 已为「{tier}」录入 {count} 条奖品。
   addcodes_empty: 没有收到任何内容,请一行一条粘贴奖品,或发送 - 结束。
   addcodes_unknown_tier: '抽奖 #{id} 没有名为「{tier}」的奖项。可选:{tiers}'
+  stock_review: '📦 抽奖 #{id}「{tier}」补货核对
+
+    本次已识别：{count} {kind}。
+
+    数量正确请点「确认入库」；独立码可继续粘贴、累计统计。
+
+    数量不对可点「全部删除并重新添加」，重新录入本次补货内容。'
+  stock_reset: 已清空「{tier}」本次尚未确认的奖品内容，请重新发送。
+  draft_stale: 这个操作已失效，请使用最新的奖品核对按钮。
 admin:
   list_empty: 当前没有进行中的抽奖。
   list_header: '🎁 进行中的抽奖,共 {count} 条:'
@@ -192,7 +203,9 @@ fsm:
     内测兑换码: 1
 
     '
-  bad_prizes: '无法解析。每行都需要是「名称:数量」,
+  duplicate_prizes_hint: 奖项名称不能重复，且每个名称不超过64字。
+  stock_save_failed: 奖品保存失败，尚未发布。草稿已保留，请稍后重新发送「确认」。
+  bad_prizes: '无法解析。每行都需要是「名称:数量」，奖项名称不能重复且不超过64字，
 
     例如「游戏礼品卡: 2」。
 
@@ -225,16 +238,14 @@ fsm:
 
     '
   bad_prizemode: 请回答 1(独立码)、2(共享文本)或 0(不自动发)。
-  enter_codes_unique: '请录入「{tier}」的奖品 (8/8),一行一条,共需 {count} 条,
+  enter_codes_unique: '请录入「{tier}」的奖品（8/8），一行一条，计划 {count} 名中奖者。
 
-    超出部分会一起存进奖池。发送 - 跳过,之后可用 /addcodes 补。
+    自动忽略空行、去除本档重复内容。可分多条消息粘贴，系统累计统计，核对后点「确认本档奖品」。
 
-    '
-  enter_codes_shared: '请录入「{tier}」的共享文本 (8/8),下一条消息会原样发给所有中奖者。
+    发送 - 可跳过本档，之后可用 /addcodes 补货。'
+  enter_codes_shared: '请录入「{tier}」的一份共享文本（8/8），整段（含换行）算一份，所有中奖者领取同一内容。
 
-    发送 - 跳过。
-
-    '
+    发送新消息会替换本档尚未确认的共享文本。核对后点「确认本档奖品」，发送 - 可跳过。'
   bad_codes: 没有收到可用的奖品内容,请一行一条粘贴,或发送 - 跳过。
   codes_short: '⚠️ 只收到 {count} 条,少于中奖名额 {needed} 条。
 
@@ -264,9 +275,13 @@ fsm:
 
     发奖方式：{prizemode}
 
+    奖品库存核对：
+
+    {inventory}
+
     将自动发布到上述全部频道和群组，共用同一场抽奖。
 
-    发送「确认」发布，发送 /cancel 放弃。'
+    确认数量后发送「确认」发布。数量不对可点「全部删除并重新添加」，或发送 /cancel 放弃。'
   saved: '✅ 抽奖已发布,保留本条消息可用于管理:'
   enter_groups: '必加群组（5/8），每行一个：
 
@@ -291,6 +306,32 @@ fsm:
   publish_partial: '抽奖 #{id} 已发布至 {sent} 处。未发布位置：{names}。
 
     修复权限后，可发送 /republish {id} 补发；已发布位置不会重复发送。'
+  codes_review: '📦「{tier}」奖品核对
+
+    已识别：{count} 条独立码（已去空行和重复项）
+
+    计划中奖：{needed} 名；{difference}
+
+    当前已录入各档合计：{total} 条
+
+
+    数量正确请点「确认本档奖品」；还可继续粘贴，累计去重统计。
+
+    数量不对可点「全部删除并重新添加」，清空所有档位的草稿奖品后重录。'
+  codes_review_shared: '📦「{tier}」共享奖品核对
+
+    已识别：{count} 份共享文本，供本档 {needed} 名中奖者领取。
+
+    本场当前共录入 {total} 份文本，不按文本行数计算。
+
+    正确请点「确认本档奖品」；重新发送文本会替换本档内容。
+
+    也可点「全部删除并重新添加」，从第一档重新录入。'
+  codes_reset: 已全部清空本场草稿中的奖品内容，将从第一个奖项重新录入。抽奖设置和计划中奖人数已保留。
+  inventory_total: 已识别奖品内容合计：{count} 份（共享模式按文本份数统计）
+  inventory_row: • {tier}：已录入 {count} 份，计划 {needed} 名中奖者
+  inventory_manual: 主办方自行发奖，未录入自动领奖内容。
+  confirm_hint: 请发送「确认」发布，或点击「全部删除并重新添加」重新录入奖品。发送 /cancel 放弃。
 poetry:
   question: '📝 抽奖 #{id} · 古诗词答题
 

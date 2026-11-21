@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Giveaway, PrizeClaim, PrizeCode
+from bot.utils.prize_input import normalize_codes
 
 log = logging.getLogger("bot.db.prize_repo")
 
@@ -71,13 +72,8 @@ async def add_codes(
     may legitimately top up with the same shared text.
     """
     tier = tier_name.strip()[:64]
-    seen: set[str] = set()
     added = 0
-    for raw in codes:
-        code = raw.strip()
-        if not code or code in seen:
-            continue
-        seen.add(code)
+    for code in normalize_codes(codes):
         session.add(
             PrizeCode(
                 giveaway_id=giveaway_id,
@@ -107,8 +103,7 @@ async def stock_by_tier(session: AsyncSession, giveaway_id: int) -> dict[str, Ti
         )
     ).all()
     return {
-        name: TierStock(name, int(total or 0), int(claimed or 0))
-        for name, total, claimed in rows
+        name: TierStock(name, int(total or 0), int(claimed or 0)) for name, total, claimed in rows
     }
 
 

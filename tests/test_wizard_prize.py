@@ -65,6 +65,9 @@ async def test_unique_codes_are_collected_then_confirmation_is_shown(sessionmake
     message = FakeMessage("AAA-1\nBBB-2")
     await step_codes(message, fsm)
 
+    assert await fsm.get_state() == GiveawayDraft.waiting_codes_review.state
+    assert (await fsm.get_data())["codes_pending"] == ["AAA-1", "BBB-2"]
+    await step_codes(FakeMessage("确认奖品"), fsm)
     data = await fsm.get_data()
     assert data["codes_buffer"] == [["Steam card", ["AAA-1", "BBB-2"]]]
     assert await fsm.get_state() == GiveawayDraft.waiting_confirm.state
@@ -86,6 +89,7 @@ async def test_shared_text_keeps_its_newlines(sessionmaker) -> None:
 
     text = "line one\nline two"
     await _handler("step_codes")(FakeMessage(text), fsm)
+    await _handler("step_codes")(FakeMessage("确认奖品"), fsm)
     buffer = (await fsm.get_data())["codes_buffer"]
     assert buffer == [["Steam card", [text]]]
 
@@ -128,4 +132,6 @@ async def test_a_short_batch_warns_but_still_moves_on(sessionmaker) -> None:
     await _handler("step_codes")(message, fsm)
 
     assert any("ONLY" not in text and "1" in text for text in message.answers)
+    assert "少 2 条" in message.answers[-1]
+    await _handler("step_codes")(FakeMessage("确认奖品"), fsm)
     assert (await fsm.get_data())["codes_buffer"] == [["Steam card", ["ONLY-ONE"]]]
