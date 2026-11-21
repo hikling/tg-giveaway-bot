@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from bot.callbacks.factories import ClaimCb
+from bot.callbacks.factories import ClaimCb, PrizeDraftCb
 from bot.db.base import get_sessionmaker
 from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_OK
 from bot.db.repo import get_giveaway
@@ -16,12 +16,21 @@ from bot.filters.admin import IsAdmin
 from bot.handlers.common import lang_of
 from bot.i18n import t
 from bot.services import prize as prize_service
+from bot.utils.prize_input import (
+    ACCEPT_TEXTS,
+    RESET_TEXTS,
+    parse_input,
+    review_controls,
+    serialize_draft,
+    valid_action,
+)
 
 log = logging.getLogger("bot.handlers.prize")
 
 
 class AddCodesDraft(StatesGroup):
     waiting_codes = State()
+    waiting_review = State()
 
 
 # Giveaways whose creator was already warned that a tier ran dry, so a
@@ -170,6 +179,49 @@ def build_prize_router() -> Router:
     return router
 
 
+async def _show_stock_review(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    owner = data.get("prize_draft_owner", message.from_user.id)
+    controls = await review_controls(state, owner, "stock")
+    await state.set_state(AddCodesDraft.waiting_review)
+    await message.answer(
+        t(
+            "prize.stock_review",
+            id=data["gid"],
+            tier=data["tier"],
+            count=len(data.get("stock_pending", [])),
+            kind="份共享文本" if data.get("stock_mode") == "shared" else "条独立码",
+        ),
+        reply_markup=controls,
+    )
+
+
+async def _reset_stock_draft(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.update_data(stock_pending=[], prize_review_token=None)
+    await state.set_state(AddCodesDraft.waiting_codes)
+    await message.answer(t("prize.stock_reset", tier=data["tier"]))
+
+
+async def _accept_stock(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    gid, tier = int(data["gid"]), data["tier"]
+    async with get_sessionmaker()() as session:
+        gw = await get_giveaway(session, gid)
+    if gw is None or gw.prize_mode == "none":
+        await state.clear()
+        await message.answer(t("prize.unknown" if gw is None else "prize.none_mode"))
+        return
+    added = await prize_service.add_codes(
+        gid,
+        tier,
+        list(data.get("stock_pending", [])),
+        max_claims=prize_service.max_claims_for(gw.prize_mode),
+    )
+    await state.clear()
+    await message.answer(t("prize.addcodes_ok", id=gid, tier=tier, count=added))
+
+
 def build_prize_admin_router() -> Router:
     """Admin stock routes: /addcodes and /prizestatus."""
     router = Router(name="prize_admin")
@@ -203,6 +255,7 @@ def build_prize_admin_router() -> Router:
         await message.answer("\n".join(lines))
 
     @router.message(Command("addcodes"))
+    @serialize_draft
     async def on_addcodes(message: Message, command: CommandObject, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
         parts = (command.args or "").split(None, 1)
@@ -222,48 +275,88 @@ def build_prize_admin_router() -> Router:
         if gw is None:
             await message.answer(t("prize.unknown", lang))
             return
+        if gw.prize_mode == "none":
+            await message.answer(t("prize.none_mode", lang))
+            return
         known = [str(tier.get("name")) for tier in (gw.prize_tiers or [])]
         if tier_name not in known:
             await message.answer(
-                t("prize.addcodes_unknown_tier", lang, id=gid, tier=tier_name, tiers=", ".join(known) or "-")
+                t(
+                    "prize.addcodes_unknown_tier",
+                    lang,
+                    id=gid,
+                    tier=tier_name,
+                    tiers=", ".join(known) or "-",
+                )
             )
             return
 
         await state.set_state(AddCodesDraft.waiting_codes)
-        await state.update_data(gid=gid, tier=tier_name)
+        await state.update_data(
+            gid=gid,
+            tier=tier_name,
+            stock_mode=gw.prize_mode,
+            stock_pending=[],
+            prize_draft_owner=message.from_user.id,
+            prize_review_token=None,
+        )
         await message.answer(t("prize.addcodes_prompt", lang, tier=tier_name))
 
     @router.message(Command("cancel"), StateFilter(AddCodesDraft))
+    @serialize_draft
     async def on_cancel_codes(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(t("common.cancel", await lang_of(message.from_user.id)))
 
-    @router.message(AddCodesDraft.waiting_codes)
+    @router.message(StateFilter(AddCodesDraft.waiting_codes, AddCodesDraft.waiting_review))
+    @serialize_draft
     async def step_codes(message: Message, state: FSMContext) -> None:
-        lang = await lang_of(message.from_user.id)
-        text = message.text or ""
-        if text.strip() == "-":
+        current = await state.get_state()
+        if current not in {AddCodesDraft.waiting_codes.state, AddCodesDraft.waiting_review.state}:
+            return
+        raw = (message.text or "").strip()
+        if raw in RESET_TEXTS:
+            await _reset_stock_draft(message, state)
+            return
+        if raw == "-":
             await state.clear()
-            await message.answer(t("common.cancel", lang))
+            await message.answer(t("common.cancel"))
             return
-        code_lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if not code_lines:
-            await message.answer(t("prize.addcodes_empty", lang))
+        if current == AddCodesDraft.waiting_review.state and raw.lower() in ACCEPT_TEXTS:
+            await _accept_stock(message, state)
             return
-
+        if not raw:
+            await message.answer(t("prize.addcodes_empty"))
+            return
         data = await state.get_data()
-        gid = int(data["gid"])
-        tier_name = str(data["tier"])
+        codes = parse_input(raw, data["stock_mode"], data.get("stock_pending", []))
+        await state.update_data(stock_pending=codes, prize_draft_owner=message.from_user.id)
+        await _show_stock_review(message, state)
 
-        sm = get_sessionmaker()
-        async with sm() as session:
-            gw = await get_giveaway(session, gid)
-        mode = gw.prize_mode if gw else "unique"
-        added = await prize_service.add_codes(
-            gid, tier_name, code_lines, max_claims=prize_service.max_claims_for(mode)
-        )
-        await state.clear()
-        await message.answer(t("prize.addcodes_ok", lang, id=gid, tier=tier_name, count=added))
-
+    @router.callback_query(PrizeDraftCb.filter(F.scope == "stock"))
+    @serialize_draft
+    async def on_stock_action(
+        cq: CallbackQuery, callback_data: PrizeDraftCb, state: FSMContext
+    ) -> None:
+        if not await IsAdmin()(cq):
+            await cq.answer(t("common.not_admin"), show_alert=True)
+            return
+        current = await state.get_state()
+        if (
+            not await valid_action(state, cq.from_user.id, callback_data)
+            or current
+            not in {AddCodesDraft.waiting_codes.state, AddCodesDraft.waiting_review.state}
+            or cq.message is None
+        ):
+            await cq.answer(t("prize.draft_stale"), show_alert=True)
+            return
+        if callback_data.action == "accept" and current != AddCodesDraft.waiting_review.state:
+            await cq.answer(t("prize.draft_stale"), show_alert=True)
+            return
+        if callback_data.action == "reset":
+            await _reset_stock_draft(cq.message, state)
+        else:
+            await _accept_stock(cq.message, state)
+        await cq.answer()
 
     return router

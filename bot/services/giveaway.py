@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayPost, GiveawayStatus
+from bot.db.prize_repo import SHARED_CAP
+from bot.db.prize_repo import add_codes as store_codes
 from bot.db.repo import (
     GiveawayView,
     TierShortfall,
@@ -47,6 +49,7 @@ async def create(
     target_participants: int | None = None,
     publishing: bool = False,
     destinations: list[tuple[int, str]] | None = None,
+    initial_codes: list[tuple[str, list[str]]] | None = None,
 ) -> Giveaway:
     # Commit before the giveaway exists in public: the hash ships in the post,
     # the seed is only revealed with the winners, so the draw can be replayed.
@@ -78,6 +81,14 @@ async def create(
         )
         for chat_id, label in dict(destinations or []).items():
             session.add(GiveawayPost(giveaway_id=gw.id, chat_id=chat_id, label=label))
+        for tier_name, codes in initial_codes or []:
+            await store_codes(
+                session,
+                gw.id,
+                tier_name,
+                codes,
+                max_claims=SHARED_CAP if prize_mode == "shared" else 1,
+            )
         await session.commit()
         return gw
 

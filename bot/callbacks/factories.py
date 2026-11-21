@@ -27,3 +27,10 @@ class PoetryCb(CallbackData, prefix="poem"):
     giveaway_id: int
     nonce: str
     choice: int
+
+
+class PrizeDraftCb(CallbackData, prefix="prizedraft"):
+    scope: str
+    owner: int
+    token: str
+    action: str
