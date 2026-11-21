@@ -52,6 +52,9 @@ class Giveaway(Base):
     description: Mapped[str] = mapped_column(String(4096), default="")
     prize_tiers: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     required_channels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    required_groups: Mapped[list[str]] = mapped_column(JSON, default=list)
+    draw_mode: Mapped[str] = mapped_column(String(16), default="time")
+    target_participants: Mapped[int | None] = mapped_column(Integer)
     # UTCDateTime, not DateTime(timezone=True): SQLite returns naive values for
     # the latter, which made every aware/naive comparison blow up.  See
     # bot/db/types.py.
@@ -202,6 +205,8 @@ class PoetryAttempt(Base):
     question_id: Mapped[int] = mapped_column(Integer)
     options: Mapped[list[str]] = mapped_column(JSON)
     nonce: Mapped[str | None] = mapped_column(String(32))
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
 
 class PoetryRotation(Base):

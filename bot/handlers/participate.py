@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, datetime
 
 from aiogram import Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.callbacks.factories import JoinCb, PoetryCb
@@ -14,10 +20,10 @@ from bot.db.repo import claim_giveaway, ensure_user, get_giveaway, has_participa
 from bot.i18n import t
 from bot.poetry import POEMS
 from bot.services.channels import missing_channels
-from bot.services.poetry import Challenge, answer, get_challenge
+from bot.services.giveaway import draw_if_full, publish_draw
+from bot.services.poetry import Challenge, answer, get_challenge, record_delivery
 from bot.settings import get_settings
 from bot.utils.antiabuse import account_age_gate
-from bot.utils.esc import esc_list
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +37,9 @@ def question_message(challenge: Challenge) -> tuple[str, InlineKeyboardMarkup]:
         author=poem.author,
         prompt=poem.prompt,
         remaining=challenge.remaining,
+        seconds=max(0, math.ceil((challenge.expires_at - datetime.now(UTC)).total_seconds()))
+        if challenge.expires_at
+        else 60,
     )
     buttons = [
         InlineKeyboardButton(
@@ -52,7 +61,11 @@ async def _eligible(cq: CallbackQuery, gid: int) -> bool:
         return False
     async with get_sessionmaker()() as session:
         gw = await get_giveaway(session, gid)
-        if gw is None or gw.status != GiveawayStatus.running or gw.end_at <= datetime.now(UTC):
+        if (
+            gw is None
+            or gw.status != GiveawayStatus.running
+            or (gw.draw_mode != "count" and gw.end_at <= datetime.now(UTC))
+        ):
             await cq.answer(t("join.ended"), show_alert=True)
             return False
         if await is_blacklisted(session, uid):
@@ -61,11 +74,21 @@ async def _eligible(cq: CallbackQuery, gid: int) -> bool:
         if await has_participated(session, gid, uid):
             await cq.answer(t("join.already"), show_alert=True)
             return False
-        channels = list(gw.required_channels)
+        channels = [*(gw.required_channels or []), *(gw.required_groups or [])]
     if channels:
         missing = await missing_channels(cq.bot, uid, channels)
         if missing:
-            await cq.answer(t("join.not_member", channels=esc_list(missing)), show_alert=True)
+            notice = t("join.not_member", channels="\n".join(missing))
+            if len(notice) <= 190:
+                await cq.answer(notice, show_alert=True)
+            else:
+                # Telegram回调弹窗最多200字符；完整要求发私聊，避免多群组时按钮报错。
+                try:
+                    await cq.bot.send_message(uid, notice)
+                    summary = "请先加入必加频道和群组，完整清单已发送到私聊。"
+                except TelegramAPIError:
+                    summary = "请先私聊机器人发送 /start，再点击参加查看完整的必加频道和群组清单。"
+                await cq.answer(summary, show_alert=True)
             return False
     return True
 
@@ -84,11 +107,21 @@ async def _send_question(cq: CallbackQuery, challenge: Challenge) -> bool:
     text, keyboard = question_message(challenge)
     try:
         await cq.bot.send_message(cq.from_user.id, text, reply_markup=keyboard)
-    except TelegramAPIError:
+    except TelegramAPIError as exc:
+        if isinstance(exc, (TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter)):
+            await record_delivery(challenge, cq.from_user.id, delivered=False)
         log.warning("无法向用户 %s 发送答题私信", cq.from_user.id)
-        await cq.answer(t("join.open_bot_first"), show_alert=True)
+        key = (
+            "join.open_bot_first"
+            if isinstance(exc, TelegramForbiddenError)
+            else "poetry.send_failed"
+        )
+        await cq.answer(t(key), show_alert=True)
         return False
-    return True
+    active = await record_delivery(challenge, cq.from_user.id, delivered=True)
+    if not active:
+        await cq.answer(t("poetry.stale"), show_alert=True)
+    return active
 
 
 def build_participate_router() -> Router:
@@ -125,33 +158,42 @@ def build_participate_router() -> Router:
             result, challenge = await answer(
                 session, gid, uid, cq.from_user.username, callback_data.nonce, callback_data.choice
             )
+            draw = await draw_if_full(session, gid) if result == "ok" else None
             await session.commit()
-        if result == "wrong":
-            # 先提交计错，再发下一题；发送失败后可点参加恢复同一道题。
-            if await _send_question(cq, challenge):
-                await cq.answer(t("poetry.wrong", remaining=challenge.remaining), show_alert=True)
-        else:
-            key = {
-                "ok": "join.ok",
-                "already": "join.already",
-                "locked": "poetry.locked",
-                "stale": "poetry.stale",
-            }[result]
-            await cq.answer(t(key), show_alert=result != "ok")
-        # 私聊中的旧题目给出清晰结果；旧按钮即使移除失败也无法重复消费。
-        if result != "stale" and getattr(cq, "message", None) and cq.message.chat.id == uid:
-            try:
-                await cq.message.edit_text(
-                    t(
-                        {
-                            "ok": "join.ok",
-                            "already": "join.already",
-                            "locked": "poetry.locked",
-                            "wrong": "poetry.previous_wrong",
-                        }[result]
+        try:
+            if result == "wrong":
+                # 先提交计错，再发下一题；发送失败后可点参加恢复同一道题。
+                if await _send_question(cq, challenge):
+                    await cq.answer(
+                        t("poetry.wrong", remaining=challenge.remaining), show_alert=True
                     )
-                )
-            except TelegramAPIError:
-                log.debug("旧答题消息更新失败", exc_info=True)
+            else:
+                key = {
+                    "ok": "join.ok",
+                    "already": "join.already",
+                    "locked": "poetry.locked",
+                    "stale": "poetry.stale",
+                    "timeout": "poetry.timeout",
+                }[result]
+                await cq.answer(t(key), show_alert=result != "ok")
+            # 私聊中的旧题目给出清晰结果；旧按钮即使移除失败也无法重复消费。
+            if result != "stale" and getattr(cq, "message", None) and cq.message.chat.id == uid:
+                try:
+                    await cq.message.edit_text(
+                        t(
+                            {
+                                "ok": "join.ok",
+                                "already": "join.already",
+                                "locked": "poetry.locked",
+                                "wrong": "poetry.previous_wrong",
+                                "timeout": "poetry.timeout",
+                            }[result]
+                        )
+                    )
+                except TelegramAPIError:
+                    log.debug("旧答题消息更新失败", exc_info=True)
+        finally:
+            if draw is not None:
+                await publish_draw(cq.bot, draw)
 
     return router

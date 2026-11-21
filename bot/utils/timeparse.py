@@ -79,15 +79,54 @@ def parse_prizes(text: str) -> list[dict] | None:
 
 
 def parse_channels(text: str) -> list[str]:
-    text = (text or "").strip()
-    if not text or text == "-":
-        return []
-    parts: list[str] = []
-    for piece in text.replace(",", " ").replace("\n", " ").split():
-        piece = piece.strip()
-        if not piece:
-            continue
-        if not piece.startswith("@"):
-            piece = "@" + piece
-        parts.append(piece)
-    return parts
+    from bot.services.channels import parse_requirements
+
+    return parse_requirements(text)
+
+
+# 为兼容旧SQLite表的非空end_at列，纯满人数模式存储一个永不调度的占位时间。
+COUNT_ONLY_END = datetime(9999, 1, 1, tzinfo=timezone.utc)
+
+
+def parse_draw_condition(
+    text: str, tz_name: str = "UTC"
+) -> tuple[str, datetime, int | None] | None:
+    """30m / 满100人 / 30m或满100人（任一先到）均可。"""
+    text = text.strip()
+    pieces = re.split(r"\s*(?:或者|或|\|)\s*", text)
+    mode, deadline, target = "time", None, None
+    if len(pieces) > 2:
+        return None
+    for piece in pieces:
+        match = re.fullmatch(r"(?:满\s*)?([0-9]{1,10})\s*人(?:参加)?(?:开奖)?", piece)
+        if match:
+            if target is not None:
+                return None
+            target = int(match[1])
+            if not 1 <= target <= 1_000_000_000:
+                return None
+        else:
+            if deadline is not None:
+                return None
+            try:
+                deadline = parse_end_at(piece, tz_name)
+            except (ValueError, OverflowError):
+                return None
+            if deadline is None:
+                return None
+    if deadline is None and target is not None:
+        mode, deadline = "count", COUNT_ONLY_END
+    elif target is not None:
+        mode = "either"
+    return mode, deadline, target
+
+
+def format_draw_condition(
+    end_at: datetime, mode: str = "time", target: int | None = None, tz_name: str = "UTC"
+) -> str:
+    if mode == "count":
+        return f"满 {target} 人有效报名后开奖"
+    label = format_local(end_at, tz_name)
+    if mode == "either":
+        return f"{label} 或满 {target} 人有效报名（任一先到）"
+    return label

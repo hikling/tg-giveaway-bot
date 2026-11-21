@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -51,7 +51,7 @@ class FakeBot:
 
     async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
         if chat_id in self.fail_for:
-            raise TelegramAPIError("sendMessage", "Forbidden: bot was blocked by the user")
+            raise TelegramForbiddenError("sendMessage", "Forbidden: bot was blocked by the user")
         self.sent.append((chat_id, text, kwargs))
 
     async def get_chat_member(self, chat_id: str, user_id: int):

@@ -18,12 +18,17 @@ from bot.keyboards.admin import admin_giveaway_panel
 from bot.keyboards.participate import participate_keyboard
 from bot.services import giveaway as gw_service
 from bot.services import prize as prize_service
-from bot.services.channels import validate_channels
+from bot.services.channels import display_requirement, validate_channels
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
 from bot.utils.esc import esc_list
 from bot.utils.render import render
-from bot.utils.timeparse import format_local, parse_channels, parse_end_at, parse_prizes
+from bot.utils.timeparse import (
+    format_draw_condition,
+    parse_channels,
+    parse_draw_condition,
+    parse_prizes,
+)
 
 log = logging.getLogger("bot.handlers.admin_create")
 
@@ -33,6 +38,7 @@ class GiveawayDraft(StatesGroup):
     waiting_description = State()
     waiting_prizes = State()
     waiting_channels = State()
+    waiting_groups = State()
     waiting_duration = State()
     waiting_prizemode = State()
     waiting_codes = State()
@@ -108,16 +114,36 @@ def build_admin_create_router() -> Router:
     @router.message(GiveawayDraft.waiting_channels)
     async def step_channels(message: Message, state: FSMContext, bot: Bot) -> None:
         lang = await lang_of(message.from_user.id)
-        channels = parse_channels(message.text or "")
+        try:
+            channels = parse_channels(message.text or "")
+        except ValueError:
+            await message.answer(t("fsm.bad_chat_ref", lang))
+            return
         if channels:
             # A channel the bot cannot read would make membership checks
             # fail closed for everybody (TelegramAPIError -> "not a member"),
             # so the giveaway could never be won. Catch it at creation.
-            missing = await validate_channels(bot, channels)
+            missing = await validate_channels(bot, channels, expected_type="channel")
             if missing:
                 await message.answer(t("fsm.bad_channels", lang, channels=esc_list(missing)))
                 return
         await state.update_data(channels=channels)
+        await state.set_state(GiveawayDraft.waiting_groups)
+        await message.answer(t("fsm.enter_groups", lang))
+
+    @router.message(GiveawayDraft.waiting_groups)
+    async def step_groups(message: Message, state: FSMContext, bot: Bot) -> None:
+        lang = await lang_of(message.from_user.id)
+        try:
+            groups = parse_channels(message.text or "")
+        except ValueError:
+            await message.answer(t("fsm.bad_chat_ref", lang))
+            return
+        missing = await validate_channels(bot, groups, expected_type="group")
+        if missing:
+            await message.answer(t("fsm.bad_groups", lang, groups=esc_list(missing)))
+            return
+        await state.update_data(groups=groups)
         await state.set_state(GiveawayDraft.waiting_duration)
         await message.answer(t("fsm.enter_duration", lang))
 
@@ -125,11 +151,14 @@ def build_admin_create_router() -> Router:
     async def step_duration(message: Message, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
         tz = get_settings().tz
-        end_at = parse_end_at(message.text or "", tz)
-        if end_at is None or end_at <= datetime.now(UTC):
+        condition = parse_draw_condition(message.text or "", tz)
+        if condition is None or (condition[0] != "count" and condition[1] <= datetime.now(UTC)):
             await message.answer(t("fsm.bad_duration", lang))
             return
-        await state.update_data(end_at_iso=end_at.isoformat())
+        mode, end_at, target = condition
+        await state.update_data(
+            end_at_iso=end_at.isoformat(), draw_mode=mode, target_participants=target
+        )
         await state.set_state(GiveawayDraft.waiting_prizemode)
         await message.answer(t("fsm.enter_prizemode", lang))
 
@@ -235,7 +264,12 @@ def build_admin_create_router() -> Router:
         data = await state.get_data()
         end_at = datetime.fromisoformat(data["end_at_iso"])
         prizes_lines = "\n".join(f"• {p['name']} × {p['count']}" for p in data["prizes"])
-        channels_text = " ".join(data["channels"]) if data["channels"] else "-"
+        channels_text = (
+            "\n".join(display_requirement(x) for x in data["channels"])
+            if data["channels"]
+            else "无"
+        )
+        groups_text = "\n".join(display_requirement(x) for x in data.get("groups", [])) or "无"
         await state.set_state(GiveawayDraft.waiting_confirm)
         await message.answer(
             t(
@@ -244,7 +278,13 @@ def build_admin_create_router() -> Router:
                 title=data["title"],
                 prizes=prizes_lines,
                 channels=channels_text,
-                ends_at=format_local(end_at, get_settings().tz),
+                groups=groups_text,
+                ends_at=format_draw_condition(
+                    end_at,
+                    data.get("draw_mode", "time"),
+                    data.get("target_participants"),
+                    get_settings().tz,
+                ),
                 prizemode=t(f"fsm.mode_{data.get('prize_mode', 'none')}", lang),
                 target=target_label,
             )
@@ -268,7 +308,7 @@ def build_admin_create_router() -> Router:
         end_at = datetime.fromisoformat(data["end_at_iso"])
         tz_name = get_settings().tz
         target_chat_id = int(data["target_chat_id"])
-        if end_at <= datetime.now(UTC):
+        if data.get("draw_mode", "time") != "count" and end_at <= datetime.now(UTC):
             await state.set_state(GiveawayDraft.waiting_duration)
             await message.answer(t("fsm.bad_duration", lang))
             return
@@ -280,6 +320,9 @@ def build_admin_create_router() -> Router:
             description=data["description"],
             prize_tiers=data["prizes"],
             required_channels=data["channels"],
+            required_groups=data.get("groups", []),
+            draw_mode=data.get("draw_mode", "time"),
+            target_participants=data.get("target_participants"),
             end_at=end_at,
             turnstile_required=False,
             prize_mode=mode,
@@ -309,8 +352,9 @@ def build_admin_create_router() -> Router:
             title=gw.title,
             description=gw.description,
             prizes=gw.prize_tiers,
-            channels=gw.required_channels,
-            ends_at=format_local(gw.end_at, tz_name),
+            channels=[display_requirement(x) for x in gw.required_channels],
+            groups=[display_requirement(x) for x in gw.required_groups],
+            ends_at=format_draw_condition(gw.end_at, gw.draw_mode, gw.target_participants, tz_name),
             count=count,
             commit=gw.draw_commit,
         )
@@ -332,7 +376,7 @@ def build_admin_create_router() -> Router:
             return
 
         await gw_service.attach_message(gw.id, sent.chat.id, sent.message_id)
-        scheduler.schedule(gw.id, gw.end_at)
+        scheduler.schedule(gw.id, gw.end_at, gw.draw_mode)
 
         # Admin controls stay in the admin chat on purpose: the public post
         # only carries the join button.

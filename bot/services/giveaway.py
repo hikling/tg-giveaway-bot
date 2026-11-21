@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 
 from aiogram import Bot
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayStatus
@@ -13,6 +15,7 @@ from bot.db.repo import (
     TierShortfall,
     blacklist_ids,
     claim_giveaway,
+    count_participants,
     create_giveaway,
     current_winner_ids,
     get_giveaway,
@@ -39,9 +42,18 @@ async def create(
     end_at: datetime,
     turnstile_required: bool,
     prize_mode: str = "none",
+    required_groups: list[str] | None = None,
+    draw_mode: str = "time",
+    target_participants: int | None = None,
 ) -> Giveaway:
     # Commit before the giveaway exists in public: the hash ships in the post,
     # the seed is only revealed with the winners, so the draw can be replayed.
+    if draw_mode not in {"time", "count", "either"}:
+        raise ValueError("无效的开奖方式")
+    if draw_mode != "time" and (
+        target_participants is None or not 1 <= target_participants <= 1_000_000_000
+    ):
+        raise ValueError("满人开奖人数必须为正整数")
     seed, commit = make_commit()
     sm = get_sessionmaker()
     async with sm() as session:
@@ -52,6 +64,9 @@ async def create(
             description=description,
             prize_tiers=prize_tiers,
             required_channels=required_channels,
+            required_groups=required_groups or [],
+            draw_mode=draw_mode,
+            target_participants=target_participants,
             end_at=end_at,
             turnstile_required=turnstile_required,
             prize_mode=prize_mode,
@@ -208,46 +223,80 @@ async def reroll_tier(
     return picks, shortfall
 
 
+@dataclass(frozen=True)
+class DrawResult:
+    giveaway: GiveawayView
+    winners: list[tuple[int, str]]
+    shortfalls: list[TierShortfall]
+    digest: str
+
+
+async def _draw_locked(session: AsyncSession, gw: Giveaway) -> DrawResult:
+    """调用方已取得抽奖写锁；开奖状态、名单和最后一次报名一起提交。"""
+    gw.status = GiveawayStatus.finished
+    participants = await list_participants(session, gw.id, verified_only=True)
+    banned = await blacklist_ids(session, [p.user_id for p in participants])
+    picks: list[tuple[int, str]] = []
+    shortfalls: list[TierShortfall] = []
+    for tier in gw.prize_tiers or []:
+        name = str(tier.get("name", "")) or "?"
+        count = int(tier.get("count", 0) or 0)
+        if count <= 0:
+            continue
+        picked, shortfall = _pick_tier(
+            participants, name, count, {u for u, _ in picks}, banned, seed=gw.draw_seed
+        )
+        picks.extend((p.user_id, name) for p in picked)
+        if shortfall is not None:
+            shortfalls.append(shortfall)
+    await log_winners(session, gw.id, picks)
+    return DrawResult(GiveawayView.of(gw), picks, shortfalls, _pool_digest(participants))
+
+
+async def draw_if_full(session: AsyncSession, gid: int) -> DrawResult | None:
+    """只在持有抽奖写锁的事务内调用，避免满额后又接纳额外用户。"""
+    gw = await get_giveaway(session, gid)
+    if (
+        gw is None
+        or gw.status != GiveawayStatus.running
+        or gw.draw_mode == "time"
+        or not gw.target_participants
+    ):
+        return None
+    count = await count_participants(session, gid, exclude_blacklisted=True)
+    if count < gw.target_participants:
+        return None
+    return await _draw_locked(session, gw)
+
+
+async def publish_draw(bot: Bot, result: DrawResult) -> None:
+    await publish_winners(
+        bot,
+        result.giveaway,
+        winners=result.winners,
+        shortfalls=result.shortfalls,
+        pool_digest=result.digest,
+    )
+
+
 async def finalize_and_publish(giveaway_id: int, bot: Bot) -> None:
-    """Draw every tier, mark the giveaway finished, announce the result."""
-    sm = get_sessionmaker()
-    async with sm() as session:
+    async with get_sessionmaker()() as session:
         gw = await claim_giveaway(
-            session,
-            giveaway_id,
-            GiveawayStatus.running,
-            new_status=GiveawayStatus.finished,
+            session, giveaway_id, GiveawayStatus.running, new_status=GiveawayStatus.finished
         )
         if gw is None:
-            log.info("finalize: giveaway %d already closed or missing", giveaway_id)
             return
-        participants = await list_participants(session, giveaway_id, verified_only=True)
-        banned = await blacklist_ids(session, [p.user_id for p in participants])
-        view = GiveawayView.of(gw)
-        digest = _pool_digest(participants)
-
-        picks: list[tuple[int, str]] = []
-        shortfalls: list[TierShortfall] = []
-        for tier in gw.prize_tiers or []:
-            name = str(tier.get("name", "")) or "?"
-            count = int(tier.get("count", 0) or 0)
-            if count <= 0:
-                continue
-            already = {u for u, _ in picks}
-            picked, shortfall = _pick_tier(
-                participants, name, count, already, banned, seed=gw.draw_seed
-            )
-            picks.extend((p.user_id, name) for p in picked)
-            if shortfall is not None:
-                # P1-5: sample_winners() clamps k to the pool size, so a
-                # tier used to shrink in silence and the post announced a
-                # prize nobody received.  The shortfall is now reported.
-                shortfalls.append(shortfall)
-
-        await log_winners(session, giveaway_id, picks)
+        result = await _draw_locked(session, gw)
         await session.commit()
+    await publish_draw(bot, result)
 
-    # ``view`` is a frozen dataclass, not the live ORM row: the old code
-    # passed a session-scoped Giveaway across the session boundary and only
-    # survived because expire_on_commit=False happened to be set.
-    await publish_winners(bot, view, winners=picks, shortfalls=shortfalls, pool_digest=digest)
+
+async def restore_count_draw(giveaway_id: int, bot: Bot) -> None:
+    async with get_sessionmaker()() as session:
+        gw = await claim_giveaway(session, giveaway_id, GiveawayStatus.running)
+        if gw is None:
+            return
+        result = await draw_if_full(session, giveaway_id)
+        await session.commit()
+    if result:
+        await publish_draw(bot, result)
