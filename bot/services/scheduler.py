@@ -41,6 +41,18 @@ class GiveawayScheduler:
         self._shutdown_requested = False
 
     def start(self) -> None:
+        from bot.services.poetry import expire_due_questions
+
+        self._scheduler.add_job(
+            expire_due_questions,
+            "interval",
+            seconds=1,
+            id="poetry-timeouts",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            kwargs={"bot": self._bot},
+        )
         self._shutdown_requested = False
         self._scheduler.start()
         log.info("scheduler started (tz=%s)", self._tz)
@@ -59,12 +71,20 @@ class GiveawayScheduler:
         async with sm() as session:
             running = await list_running_giveaways(session)
         log.info("restoring %d running giveaway(s)", len(running))
-        for gw in running:
-            self.schedule(gw.id, gw.end_at)
+        from bot.services.giveaway import restore_count_draw
+        from bot.services.poetry import expire_due_questions
 
-    def schedule(self, giveaway_id: int, end_at: datetime) -> None:
+        for gw in running:
+            self.schedule(gw.id, gw.end_at, gw.draw_mode)
+            if gw.draw_mode in {"count", "either"}:
+                await restore_count_draw(gw.id, self._bot)
+        await expire_due_questions(self._bot)
+
+    def schedule(self, giveaway_id: int, end_at: datetime, draw_mode: str = "time") -> None:
         from bot.services import giveaway as gw_service
 
+        if draw_mode == "count":
+            return
         run_at = _as_utc(end_at, giveaway_id)
         if run_at <= datetime.now(timezone.utc):
             # A giveaway restored from the DB whose deadline already passed

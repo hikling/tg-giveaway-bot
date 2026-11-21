@@ -50,6 +50,9 @@ class GiveawayView:
     required_channels: tuple[str, ...] = ()
     prize_tiers: tuple[dict[str, Any], ...] = ()
     end_at: datetime | None = None
+    required_groups: tuple[str, ...] = ()
+    draw_mode: str = "time"
+    target_participants: int | None = None
 
     @classmethod
     def of(cls, gw: Giveaway) -> "GiveawayView":
@@ -67,6 +70,9 @@ class GiveawayView:
             required_channels=tuple(gw.required_channels or ()),
             prize_tiers=tuple(dict(t) for t in (gw.prize_tiers or ())),
             end_at=gw.end_at,
+            required_groups=tuple(gw.required_groups or ()),
+            draw_mode=gw.draw_mode or "time",
+            target_participants=gw.target_participants,
         )
 
 
@@ -146,6 +152,9 @@ async def create_giveaway(
     prize_mode: str = "none",
     draw_seed: str | None = None,
     draw_commit: str | None = None,
+    required_groups: list[str] | None = None,
+    draw_mode: str = "time",
+    target_participants: int | None = None,
 ) -> Giveaway:
     gw = Giveaway(
         creator_id=creator_id,
@@ -153,6 +162,9 @@ async def create_giveaway(
         description=description,
         prize_tiers=prize_tiers,
         required_channels=required_channels,
+        required_groups=required_groups or [],
+        draw_mode=draw_mode,
+        target_participants=target_participants,
         end_at=end_at,
         turnstile_required=turnstile_required,
         prize_mode=prize_mode,
@@ -223,7 +235,7 @@ async def claim_giveaway(
     """
     stmt = update(Giveaway).where(Giveaway.id == giveaway_id, Giveaway.status == expected_status)
     if require_open:
-        stmt = stmt.where(Giveaway.end_at > _now())
+        stmt = stmt.where(or_(Giveaway.draw_mode == "count", Giveaway.end_at > _now()))
     stmt = stmt.values(
         status=new_status if new_status is not None else Giveaway.status
     ).execution_options(synchronize_session=False)
@@ -299,11 +311,17 @@ async def has_participated(session: AsyncSession, giveaway_id: int, user_id: int
 
 
 async def count_participants(
-    session: AsyncSession, giveaway_id: int, verified_only: bool = True
+    session: AsyncSession,
+    giveaway_id: int,
+    verified_only: bool = True,
+    *,
+    exclude_blacklisted: bool = False,
 ) -> int:
     stmt = select(func.count(Participant.id)).where(Participant.giveaway_id == giveaway_id)
     if verified_only:
         stmt = stmt.where(Participant.verified.is_(True))
+    if exclude_blacklisted:
+        stmt = stmt.where(Participant.user_id.not_in(select(Blacklist.user_id)))
     return int((await session.execute(stmt)).scalar_one())
 
 

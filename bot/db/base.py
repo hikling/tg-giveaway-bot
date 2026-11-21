@@ -52,6 +52,11 @@ _LIGHTWEIGHT_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("giveaways", "prize_mode", "VARCHAR(16) DEFAULT 'none'"),
     ("giveaways", "draw_seed", "VARCHAR(64)"),
     ("giveaways", "draw_commit", "VARCHAR(64)"),
+    ("giveaways", "required_groups", "JSON DEFAULT '[]'"),
+    ("giveaways", "draw_mode", "VARCHAR(16) DEFAULT 'time'"),
+    ("giveaways", "target_participants", "INTEGER"),
+    ("poetry_attempts", "expires_at", "DATETIME"),
+    ("poetry_attempts", "sent_at", "DATETIME"),
 )
 
 
@@ -138,7 +143,19 @@ async def _apply_lightweight_migrations(conn) -> None:
         if column in existing:
             continue
         await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+        if table == "poetry_attempts" and column == "expires_at":
+            # 升级前已发出的旧题统一获得60秒作答时间，仅在首次添加列时执行。
+            await conn.exec_driver_sql(
+                "UPDATE poetry_attempts SET expires_at=datetime('now', '+60 seconds') WHERE nonce IS NOT NULL"
+            )
+        if table == "poetry_attempts" and column == "sent_at":
+            await conn.exec_driver_sql(
+                "UPDATE poetry_attempts SET sent_at=datetime('now') WHERE nonce IS NOT NULL"
+            )
         log.info("migration: added %s.%s", table, column)
+    await conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_poetry_attempts_expires_at ON poetry_attempts (expires_at)"
+    )
 
 
 async def init_db(database_url: str) -> None:

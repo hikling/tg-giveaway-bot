@@ -1,90 +1,102 @@
-"""Required-channel enforcement.
-
-``required_channels`` used to be stored and printed and then... nothing.
-There was not a single ``get_chat_member`` call in the project, so the
-"join the channels to enter" promise in the README and in the giveaway
-post was pure decoration.  The locale string for the failure case existed
-and was never reachable.
-
-The check is deliberately **fail-closed**: a channel the bot cannot inspect
-(it was demoted, or the admin typo-ed a username) is reported as missing,
-because the alternative — silently waving everybody through — would be a
-quiet, permanent hole in the entry rules.  That failure is loud and
-visible instead, and ``validate_channels()`` is called when the giveaway is
-created so the problem is reported to the admin before anybody tries to
-enter.
-"""
+"""频道与群组的真实成员校验；无法确认成员资格时拒绝报名。"""
 
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+import re
+from collections.abc import Sequence
+from urllib.parse import urlparse
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
-log = logging.getLogger("bot.services.channels")
+log = logging.getLogger(__name__)
 
 
-def _normalise(ref: str) -> str:
-    ref = ref.strip()
-    if ref.startswith("https://t.me/"):
-        ref = ref.rstrip("/").rsplit("/", 1)[-1]
-    return ref if ref.startswith("@") else f"@{ref}"
+def _normalise(raw: str) -> str | int:
+    ref = raw.split("|", 1)[0].strip()
+    if re.fullmatch(r"-[1-9][0-9]{0,18}", ref) and -(2**63) <= int(ref):
+        return int(ref)
+    if ref.startswith(("https://t.me/", "http://t.me/", "t.me/")):
+        path = urlparse(ref if "://" in ref else "https://" + ref).path.strip("/")
+        ref = path
+    ref = ref.removeprefix("@")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", ref) or ref == "joinchat":
+        raise ValueError("请输入公开用户名，或私有频道/群组的负数编号；邀请链接需附在编号后面")
+    return "@" + ref
+
+
+def parse_requirements(text: str) -> list[str]:
+    if not text.strip() or text.strip() == "-":
+        return []
+    result = []
+    # 每行一个，兼容旧版以空格和逗号分隔公开用户名的格式。
+    for line in text.replace("，", ",").splitlines():
+        entries = [line] if "|" in line else re.split(r"[\s,]+", line)
+        for entry in entries:
+            if not entry.strip():
+                continue
+            ref = _normalise(entry)
+            parts = entry.split("|", 1)
+            link = parts[1].strip() if len(parts) == 2 else ""
+            if len(parts) == 2:
+                url = urlparse(link)
+                if url.scheme != "https" or url.netloc != "t.me" or not url.path.strip("/"):
+                    raise ValueError("邀请链接需为 https://t.me/ 开头的有效链接")
+            value = str(ref) + ("|" + link if link else "")
+            if value not in result:
+                result.append(value)
+    return result
+
+
+def display_requirement(raw: str) -> str:
+    parts = raw.split("|", 1)
+    return parts[0] + (f"（{parts[1]}）" if len(parts) == 2 else "")
 
 
 async def missing_channels(bot: Bot, user_id: int, channels: Sequence[str]) -> tuple[str, ...]:
-    """Channels of ``channels`` that ``user_id`` has not joined.
-
-    An empty result means the user satisfies every requirement.
-    """
-    if not channels:
-        return ()
-    missing: list[str] = []
+    missing = []
     for raw in channels:
-        ref = _normalise(raw)
-        if not len(ref) > 1:
-            continue
         try:
+            ref = _normalise(raw)
             member = await bot.get_chat_member(ref, user_id)
-        except TelegramAPIError as exc:
-            # Includes "bot is not a member" and "chat not found": we cannot
-            # prove membership, so we do not grant it.
-            log.warning("channel check failed for %s: %s", ref, exc)
-            missing.append(ref)
+        except (TelegramAPIError, ValueError) as exc:
+            log.warning("成员校验失败：%s：%s", raw, exc)
+            missing.append(display_requirement(raw))
             continue
         status = str(getattr(member.status, "value", member.status) or "")
-        if status in {"member", "administrator", "owner", "creator"}:
-            continue
-        if status in {"left", "kicked"}:
-            missing.append(ref)
+        if status in {"member", "administrator", "creator", "owner"}:
             continue
         if status == "restricted" and getattr(member, "is_member", False):
             continue
-        missing.append(ref)
+        missing.append(display_requirement(raw))
     return tuple(missing)
 
 
-async def validate_channels(bot: Bot, channels: Sequence[str]) -> tuple[str, ...]:
-    """Creation-time check: can the bot actually see every required channel?
-
-    Returns a tuple of human-readable problems, empty when the giveaway is
-    safe to create.  The bot must be a member (administrator is better) or
-    the entry gate cannot be enforced.
-    """
-    problems: list[str] = []
+async def validate_channels(
+    bot: Bot, channels: Sequence[str], *, expected_type: str | None = None
+) -> tuple[str, ...]:
+    problems = []
+    if not channels:
+        return ()
+    me = await bot.get_me()
     for raw in channels:
-        ref = _normalise(raw)
-        if not len(ref) > 1:
-            problems.append(str(raw))
-            continue
         try:
-            me = await bot.get_me()
+            ref = _normalise(raw)
+            if expected_type:
+                chat = await bot.get_chat(ref)
+                kind = str(getattr(chat.type, "value", chat.type))
+                allowed = {"channel"} if expected_type == "channel" else {"group", "supergroup"}
+                if kind not in allowed:
+                    problems.append(
+                        f"{raw}（类型不符，请填写{'频道' if expected_type == 'channel' else '群组'}）"
+                    )
+                    continue
             member = await bot.get_chat_member(ref, me.id)
-        except TelegramAPIError as exc:
-            problems.append(f"{ref} ({exc})")
+        except (TelegramAPIError, ValueError):
+            problems.append(f"{raw}（无法访问，请检查编号并添加机器人）")
             continue
         status = str(getattr(member.status, "value", member.status) or "")
         if status not in {"administrator", "creator", "owner"}:
-            problems.append(f"{ref} (bot must be an administrator)")
+            problems.append(f"{raw}（机器人必须是管理员）")
     return tuple(problems)

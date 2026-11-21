@@ -238,7 +238,9 @@ async def test_failed_dm_preserves_question_and_chances(sessionmaker, new_giveaw
     assert "/start" in query.answer.await_args.args[0]
     bot.fail_for.clear()
     resent, _ = await begin(bot, gid)
-    assert resent == challenge and resent.remaining == 5
+    assert resent.nonce == challenge.nonce and resent.question_id == challenge.question_id
+    assert resent.options == challenge.options and resent.remaining == 5
+    assert challenge.expires_at is None and resent.expires_at is not None
 
 
 async def test_old_english_preferences_and_legacy_captcha_do_not_bypass_poetry(

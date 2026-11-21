@@ -28,7 +28,7 @@ from bot.services.notifier import retry_pending
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
 from bot.utils.esc import esc, user_mention
-from bot.utils.timeparse import format_local
+from bot.utils.timeparse import format_draw_condition
 
 log = logging.getLogger("bot.handlers.admin_manage")
 
@@ -103,7 +103,9 @@ def build_admin_manage_router() -> Router:
                     lang,
                     id=gw.id,
                     title=gw.title,
-                    ends_at=format_local(gw.end_at, tz),
+                    ends_at=format_draw_condition(
+                        gw.end_at, gw.draw_mode, gw.target_participants, tz
+                    ),
                     count=counts[gw.id],
                 )
             )
