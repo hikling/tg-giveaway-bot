@@ -55,6 +55,7 @@ class Giveaway(Base):
     required_groups: Mapped[list[str]] = mapped_column(JSON, default=list)
     draw_mode: Mapped[str] = mapped_column(String(16), default="time")
     target_participants: Mapped[int | None] = mapped_column(Integer)
+    publishing: Mapped[bool] = mapped_column(Boolean, default=False)
     # UTCDateTime, not DateTime(timezone=True): SQLite returns naive values for
     # the latter, which made every aware/naive comparison blow up.  See
     # bot/db/types.py.
@@ -210,9 +211,22 @@ class PoetryAttempt(Base):
 
 
 class PoetryRotation(Base):
-    """跨抽奖轮换，50题用完后开启新一轮。"""
+    """跨抽奖轮换，25题用完后开启新一轮。"""
 
     __tablename__ = "poetry_rotations"
 
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     used_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+
+
+class GiveawayPost(Base):
+    """一场抽奖在不同频道/群组的发布记录，空消息编号代表待发布。"""
+
+    __tablename__ = "giveaway_posts"
+    giveaway_id: Mapped[int] = mapped_column(
+        ForeignKey("giveaways.id", ondelete="CASCADE"), primary_key=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    label: Mapped[str] = mapped_column(String(128))
+    message_id: Mapped[int | None] = mapped_column(BigInteger)
+    send_error: Mapped[str | None] = mapped_column(String(128))

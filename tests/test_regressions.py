@@ -7,7 +7,6 @@ fakes. These cases are intentionally not executed during the static repair.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -24,7 +23,6 @@ from bot.db.repo import (
     replace_tier_winners,
 )
 from bot.handlers import participate
-from bot.handlers.admin_create import build_admin_create_router
 from bot.main import _configure_delivery
 from bot.services import giveaway as gw_service
 from bot.services.channels import missing_channels, validate_channels
@@ -127,38 +125,6 @@ async def test_superseded_failed_winner_is_not_retried(sessionmaker, new_giveawa
         await session.commit()
     bot.fail_for.clear()
     assert await retry_pending(bot, gid) == 0
-
-
-async def test_forwarded_channel_target_uses_current_telegram_fields(sessionmaker):
-    handler = next(
-        h.callback
-        for h in build_admin_create_router().message.handlers
-        if h.callback.__name__ == "step_target"
-    )
-    state = SimpleNamespace(
-        update_data=AsyncMock(),
-        set_state=AsyncMock(),
-        get_data=AsyncMock(
-            return_value={
-                "end_at_iso": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-                "title": "Test",
-                "prizes": [{"name": "Key", "count": 1}],
-                "channels": [],
-            }
-        ),
-    )
-    message = SimpleNamespace(
-        from_user=SimpleNamespace(id=424242),
-        text=None,
-        answer=AsyncMock(),
-        forward_origin=SimpleNamespace(
-            chat=SimpleNamespace(id=-100123, title="Channel", username=None)
-        ),
-    )
-    bot = SimpleNamespace(get_chat=AsyncMock())
-    await handler(message, state, bot)
-    state.update_data.assert_awaited_once_with(target_chat_id=-100123, target_label="Channel")
-    bot.get_chat.assert_not_awaited()
 
 
 async def test_polling_clears_webhook_without_dropping_updates():

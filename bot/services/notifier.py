@@ -35,9 +35,7 @@ async def _winner_langs(session, winner_ids: Sequence[int]) -> dict[int, str]:
     return {u.user_id: u.lang for u in (await session.execute(stmt)).scalars().all() if u.lang}
 
 
-def _claim_keyboard(
-    giveaway: GiveawayView, tier: str, lang: str
-) -> InlineKeyboardMarkup | None:
+def _claim_keyboard(giveaway: GiveawayView, tier: str, lang: str) -> InlineKeyboardMarkup | None:
     """The "claim my prize" button, or None when the host delivers by hand.
 
     The tier travels as its position in ``prize_tiers``; a tier that no longer
@@ -142,12 +140,16 @@ async def publish_winners(
         )
     text = NL.join(lines)
 
-    if giveaway.chat_id and giveaway.message_id:
+    from bot.services.publication import post_locations
+
+    for chat_id, message_id in await post_locations(
+        giveaway.id, giveaway.chat_id, giveaway.message_id
+    ):
         try:
             await bot.send_message(
-                giveaway.chat_id,
+                chat_id,
                 text,
-                reply_to_message_id=giveaway.message_id,
+                reply_to_message_id=message_id,
             )
         except Exception:
             log.exception("publish_winners: send_message failed")
@@ -162,9 +164,7 @@ async def publish_winners(
                 giveaway.creator_id,
                 t("winner_dm.host", winner_lang, id=giveaway.creator_id),
             )
-        body_key = (
-            "winner_dm.body" if giveaway.prize_mode == "none" else "winner_dm.body_claim"
-        )
+        body_key = "winner_dm.body" if giveaway.prize_mode == "none" else "winner_dm.body_claim"
         body = t(
             body_key,
             winner_lang,
@@ -236,12 +236,8 @@ async def retry_pending(bot: Bot, giveaway_id: int) -> int:
                 giveaway.creator_id, t("winner_dm.host", winner_lang, id=giveaway.creator_id)
             )
         )
-        body_key = (
-            "winner_dm.body" if giveaway.prize_mode == "none" else "winner_dm.body_claim"
-        )
-        body = t(
-            body_key, winner_lang, title=giveaway.title, tier=tier, creator=creator_str
-        )
+        body_key = "winner_dm.body" if giveaway.prize_mode == "none" else "winner_dm.body_claim"
+        body = t(body_key, winner_lang, title=giveaway.title, tier=tier, creator=creator_str)
         ok, error = True, None
         try:
             # A retried DM must carry the claim button too, otherwise a winner

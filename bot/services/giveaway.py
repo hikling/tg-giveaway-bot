@@ -9,7 +9,7 @@ from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import get_sessionmaker
-from bot.db.models import Giveaway, GiveawayStatus
+from bot.db.models import Giveaway, GiveawayPost, GiveawayStatus
 from bot.db.repo import (
     GiveawayView,
     TierShortfall,
@@ -45,6 +45,8 @@ async def create(
     required_groups: list[str] | None = None,
     draw_mode: str = "time",
     target_participants: int | None = None,
+    publishing: bool = False,
+    destinations: list[tuple[int, str]] | None = None,
 ) -> Giveaway:
     # Commit before the giveaway exists in public: the hash ships in the post,
     # the seed is only revealed with the winners, so the draw can be replayed.
@@ -67,12 +69,15 @@ async def create(
             required_groups=required_groups or [],
             draw_mode=draw_mode,
             target_participants=target_participants,
+            publishing=publishing,
             end_at=end_at,
             turnstile_required=turnstile_required,
             prize_mode=prize_mode,
             draw_seed=seed,
             draw_commit=commit,
         )
+        for chat_id, label in dict(destinations or []).items():
+            session.add(GiveawayPost(giveaway_id=gw.id, chat_id=chat_id, label=label))
         await session.commit()
         return gw
 
@@ -259,6 +264,7 @@ async def draw_if_full(session: AsyncSession, gid: int) -> DrawResult | None:
     if (
         gw is None
         or gw.status != GiveawayStatus.running
+        or gw.publishing
         or gw.draw_mode == "time"
         or not gw.target_participants
     ):
@@ -284,7 +290,7 @@ async def finalize_and_publish(giveaway_id: int, bot: Bot) -> None:
         gw = await claim_giveaway(
             session, giveaway_id, GiveawayStatus.running, new_status=GiveawayStatus.finished
         )
-        if gw is None:
+        if gw is None or gw.publishing:
             return
         result = await _draw_locked(session, gw)
         await session.commit()

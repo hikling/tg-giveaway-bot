@@ -53,7 +53,8 @@ async def _next(session: AsyncSession, row: PoetryAttempt) -> None:
     if rotation is None:
         rotation = PoetryRotation(user_id=row.user_id, used_ids=[])
         session.add(rotation)
-    used = list(rotation.used_ids)
+    # 升级到25题后移除旧轮换中的退休编号，保留仍有效题目的顺序。
+    used = list(dict.fromkeys(i for i in rotation.used_ids if 0 <= i < len(POEMS)))
     available = [i for i in range(len(POEMS)) if i not in used]
     if not available:
         # 新一轮第一题也不与上一轮最后一题相同。
@@ -83,7 +84,7 @@ async def get_challenge(session: AsyncSession, gid: int, uid: int) -> Challenge 
     expire_question(row)
     if row.wrong_count >= MAX_WRONG:
         return None
-    if not row.nonce:
+    if not row.nonce or not 0 <= row.question_id < len(POEMS):
         # 解封后若管理员已清除了旧报名，重新答题但保留历史错误次数。
         await _next(session, row)
     return view(row)
@@ -105,6 +106,9 @@ async def answer(
         return "stale", None
     if expire_question(row):
         return ("locked" if row.wrong_count >= MAX_WRONG else "timeout"), None
+    if not 0 <= row.question_id < len(POEMS):
+        await _next(session, row)
+        return "replaced", view(row)
     if row.options[choice] == POEMS[row.question_id].answer:
         row.nonce = None
         row.expires_at = None

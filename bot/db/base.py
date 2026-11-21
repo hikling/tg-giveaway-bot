@@ -55,6 +55,7 @@ _LIGHTWEIGHT_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("giveaways", "required_groups", "JSON DEFAULT '[]'"),
     ("giveaways", "draw_mode", "VARCHAR(16) DEFAULT 'time'"),
     ("giveaways", "target_participants", "INTEGER"),
+    ("giveaways", "publishing", "BOOLEAN DEFAULT 0"),
     ("poetry_attempts", "expires_at", "DATETIME"),
     ("poetry_attempts", "sent_at", "DATETIME"),
 )
