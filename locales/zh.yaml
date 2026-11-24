@@ -120,6 +120,8 @@ prize:
     '
   already: 你已经领过这个奖项了,发送 /myprizes 可以重新查看。
   not_winner: 只有中奖者才能领取该奖品。
+  not_drawn: 这场抽奖还未开奖，暂无可领取的奖品。
+  dm_failed: 奖品已存入你的领取记录。请打开机器人私聊，发送 /myprizes 查看。
   none_mode: 这场抽奖没有开启自助领奖。
   unknown: 找不到这场抽奖,可能已被删除。
   claim_usage: 用法:/claim 〈抽奖编号〉
@@ -129,6 +131,8 @@ prize:
 
     '
   myprizes_empty: 你还没有领取过奖品。
+  private_history: 请在机器人私聊发送 /myprizes 查看你的奖品。
+  private_admin: 请在机器人私聊或管理员小程序创建抽奖和录入奖品，避免在群里发送奖品内容。
   myprizes_header: '🎁 你已领取的奖品(共 {count} 份):'
   myprizes_row: '#{id} {title} — {tier}
 
@@ -156,6 +160,8 @@ prize:
 
     数量不对可点「全部删除并重新添加」，重新录入本次补货内容。'
   stock_reset: 已清空「{tier}」本次尚未确认的奖品内容，请重新发送。
+  stock_duplicates: 已跳过 {count} 条本场奖池里已有的独立码。
+  duplicate_tiers: 本档的独立码与其他奖项重复，请使用「全部删除并重新添加」重新录入。
   draft_stale: 这个操作已失效，请使用最新的奖品核对按钮。
 admin:
   list_empty: 当前没有进行中的抽奖。
@@ -174,6 +180,7 @@ admin:
   reroll_running: '#{id} 仍在进行中,只有结束后才能重抽。'
   reroll_canceled: '#{id} 已被取消,无需重抽。'
   reroll_no_tier: '抽奖 #{id} 没有名为 {tier} 的奖项。'
+  reroll_claimed: '#{id} / {tier}：已有奖品被领取，无法重抽。'
   reroll_empty: '#{id} / {tier}:已没有符合条件的参与者。'
   ban_ok: 🚫 已拉黑 {user_id},并清除其 {n} 条报名记录。
   ban_ok_none: 🚫 已拉黑 {user_id},其名下没有有效报名记录。

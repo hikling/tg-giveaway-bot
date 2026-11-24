@@ -21,6 +21,7 @@ from bot.i18n import t
 from bot.poetry import POEMS
 from bot.services.channels import display_requirement, linked_requirements, missing_channels
 from bot.services.giveaway import draw_if_full, publish_draw
+from bot.services.notifier import winner_delivery_lock
 from bot.services.poetry import Challenge, answer, get_challenge, record_delivery
 from bot.settings import get_settings
 from bot.utils.antiabuse import account_age_gate
@@ -101,7 +102,9 @@ async def _eligible(cq: CallbackQuery, gid: int) -> bool:
 
 
 async def _locked_eligibility(session, gid: int, uid: int) -> str | None:
-    if await claim_giveaway(session, gid, GiveawayStatus.running, require_open=True) is None:
+    gw = await claim_giveaway(session, gid, GiveawayStatus.running, require_open=True)
+    # The UPDATE might have waited for a database writer across the deadline.
+    if gw is None or (gw.draw_mode != "count" and gw.end_at <= datetime.now(UTC)):
         return "join.ended"
     if await is_blacklisted(session, uid):
         return "join.banned"
@@ -131,6 +134,30 @@ async def _send_question(cq: CallbackQuery, challenge: Challenge) -> bool:
     return active
 
 
+async def _report_answer(cq: CallbackQuery, result: str, challenge: Challenge | None) -> None:
+    messages = {
+        "ok": "join.ok",
+        "already": "join.already",
+        "locked": "poetry.locked",
+        "stale": "poetry.stale",
+        "timeout": "poetry.timeout",
+        "wrong": "poetry.previous_wrong",
+        "replaced": "poetry.replaced",
+    }
+    if result in {"wrong", "replaced"} and challenge is not None:
+        # Record the answer before attempting to send the next question.
+        if await _send_question(cq, challenge):
+            key = "poetry.replaced" if result == "replaced" else "poetry.wrong"
+            await cq.answer(t(key, remaining=challenge.remaining), show_alert=True)
+    else:
+        await cq.answer(t(messages[result]), show_alert=result != "ok")
+    if result != "stale" and getattr(cq, "message", None) and cq.message.chat.id == cq.from_user.id:
+        try:
+            await cq.message.edit_text(t(messages[result]))
+        except TelegramAPIError:
+            log.debug("旧答题消息更新失败", exc_info=True)
+
+
 def build_participate_router() -> Router:
     router = Router(name="participate")
 
@@ -157,55 +184,23 @@ def build_participate_router() -> Router:
         gid, uid = callback_data.giveaway_id, cq.from_user.id
         if not await _eligible(cq, gid):
             return
-        async with get_sessionmaker()() as session:
-            error = await _locked_eligibility(session, gid, uid)
-            if error:
-                await cq.answer(t(error), show_alert=True)
-                return
-            result, challenge = await answer(
-                session, gid, uid, cq.from_user.username, callback_data.nonce, callback_data.choice
-            )
-            draw = await draw_if_full(session, gid) if result == "ok" else None
-            await session.commit()
-        try:
-            if result in {"wrong", "replaced"}:
-                # 先提交计错，再发下一题；发送失败后可点参加恢复同一道题。
-                if await _send_question(cq, challenge):
-                    await cq.answer(
-                        t(
-                            "poetry.replaced" if result == "replaced" else "poetry.wrong",
-                            remaining=challenge.remaining,
-                        ),
-                        show_alert=True,
-                    )
-            else:
-                key = {
-                    "ok": "join.ok",
-                    "already": "join.already",
-                    "locked": "poetry.locked",
-                    "stale": "poetry.stale",
-                    "timeout": "poetry.timeout",
-                }[result]
-                await cq.answer(t(key), show_alert=result != "ok")
-            # 私聊中的旧题目给出清晰结果；旧按钮即使移除失败也无法重复消费。
-            if result != "stale" and getattr(cq, "message", None) and cq.message.chat.id == uid:
-                try:
-                    await cq.message.edit_text(
-                        t(
-                            {
-                                "ok": "join.ok",
-                                "already": "join.already",
-                                "locked": "poetry.locked",
-                                "wrong": "poetry.previous_wrong",
-                                "replaced": "poetry.replaced",
-                                "timeout": "poetry.timeout",
-                            }[result]
-                        )
-                    )
-                except TelegramAPIError:
-                    log.debug("旧答题消息更新失败", exc_info=True)
-        finally:
+        async with winner_delivery_lock(gid):
+            async with get_sessionmaker()() as session:
+                error = await _locked_eligibility(session, gid, uid)
+                if error:
+                    await cq.answer(t(error), show_alert=True)
+                    return
+                result, challenge = await answer(
+                    session, gid, uid, cq.from_user.username, callback_data.nonce, callback_data.choice
+                )
+                draw = await draw_if_full(session, gid) if result == "ok" else None
+                await session.commit()
             if draw is not None:
-                await publish_draw(cq.bot, draw)
+                try:
+                    await _report_answer(cq, result, challenge)
+                finally:
+                    await publish_draw(cq.bot, draw)
+                return
+        await _report_answer(cq, result, challenge)
 
     return router

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -70,27 +71,20 @@ def absolutize_sqlite_url(database_url: str) -> str:
     a double-clicked file created the database in a different, surprising
     place.  Relative paths now always mean "relative to the project root".
     """
-    prefix, sep, rest = database_url.partition(":///")
-    if not sep:
+    path = sqlite_path_of(database_url)
+    if path is None or path.is_absolute():
         return database_url
-    path, qsep, query = rest.partition("?")
-    if not path or path.startswith(":memory:") or path == "":
-        return database_url
-    candidate = Path(path[2:] if path.startswith("./") else path)
-    if not candidate.is_absolute():
-        candidate = PROJECT_ROOT / candidate
-    resolved = candidate.as_posix()
-    return f"{prefix}:///{resolved}" + (f"?{query}" if qsep else "")
+    url = make_url(database_url).set(database=(PROJECT_ROOT / path).as_posix())
+    return url.render_as_string(hide_password=False)
 
 
 def sqlite_path_of(database_url: str) -> Path | None:
     """Filesystem path behind a SQLite URL, or None for other backends."""
     if not database_url.startswith("sqlite"):
         return None
-    _prefix, sep, rest = database_url.partition(":///")
-    if not sep:
-        return None
-    path, _qsep, _query = rest.partition("?")
+    # SQLAlchemy 2.1 renders Windows drive letters and non-ASCII path
+    # segments with percent escapes. Parse them before testing absoluteness.
+    path = make_url(database_url).database
     if not path or path.startswith(":memory:"):
         return None
     return Path(path)
@@ -168,7 +162,7 @@ async def init_db(database_url: str) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         log.info("sqlite path: %s", db_path)
 
-    _engine = create_async_engine(database_url, future=True, echo=False)
+    _engine = create_async_engine(database_url, future=True, echo=False, hide_parameters=True)
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
 
     if database_url.startswith("sqlite"):

@@ -5,7 +5,7 @@ import pytest
 from bot.callbacks.factories import ClaimCb
 from bot.db.models import GiveawayStatus
 from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_OK, SHARED_CAP
-from bot.db.repo import GiveawayView, log_winners
+from bot.db.repo import GiveawayView, get_giveaway, log_winners
 from bot.handlers import prize as prize_handlers
 from bot.services import prize as prize_service
 from bot.services.notifier import _claim_keyboard
@@ -14,9 +14,25 @@ ADMIN_ID = 424242
 TIER = "Steam card"
 
 
+@pytest.fixture
+def winning_giveaway(sessionmaker, new_giveaway):
+    async def create(mode, *winner_ids):
+        gid = await new_giveaway(
+            prize_mode=mode, prize_tiers=[{"name": TIER, "count": len(winner_ids)}]
+        )
+        async with sessionmaker() as session:
+            gw = await get_giveaway(session, gid)
+            gw.status = GiveawayStatus.finished
+            await log_winners(session, gid, [(user_id, TIER) for user_id in winner_ids])
+            await session.commit()
+        return gid
+
+    return create
+
+
 @pytest.mark.asyncio
-async def test_unique_codes_are_handed_out_exactly_once(sessionmaker, new_giveaway) -> None:
-    gid = await new_giveaway(prize_mode="unique")
+async def test_unique_codes_are_handed_out_exactly_once(winning_giveaway) -> None:
+    gid = await winning_giveaway("unique", 1001, 1002, 1003)
     assert await prize_service.add_codes(gid, TIER, ["AAA-1", "BBB-2"]) == 2
 
     first = await prize_service.claim(gid, 1001, TIER)
@@ -35,8 +51,8 @@ async def test_unique_codes_are_handed_out_exactly_once(sessionmaker, new_giveaw
 
 
 @pytest.mark.asyncio
-async def test_second_claim_by_the_same_winner_is_idempotent(sessionmaker, new_giveaway) -> None:
-    gid = await new_giveaway(prize_mode="unique")
+async def test_second_claim_by_the_same_winner_is_idempotent(winning_giveaway) -> None:
+    gid = await winning_giveaway("unique", 1001)
     await prize_service.add_codes(gid, TIER, ["ONLY-ONE"])
 
     first = await prize_service.claim(gid, 1001, TIER)
@@ -53,8 +69,8 @@ async def test_second_claim_by_the_same_winner_is_idempotent(sessionmaker, new_g
 
 
 @pytest.mark.asyncio
-async def test_shared_text_is_readable_by_every_winner(sessionmaker, new_giveaway) -> None:
-    gid = await new_giveaway(prize_mode="shared")
+async def test_shared_text_is_readable_by_every_winner(winning_giveaway) -> None:
+    gid = await winning_giveaway("shared", 1001, 2002)
     await prize_service.add_codes(
         gid, TIER, ["USE-THIS-CODE"], max_claims=prize_service.max_claims_for("shared")
     )
@@ -76,12 +92,8 @@ async def test_add_codes_skips_blanks_and_duplicates_in_one_batch(sessionmaker, 
 
 
 @pytest.mark.asyncio
-async def test_only_current_winners_hold_a_tier(sessionmaker, new_giveaway) -> None:
-    gid = await new_giveaway(prize_mode="unique")
-    async with sessionmaker() as session:
-        await log_winners(session, gid, [(1001, TIER)])
-        await session.commit()
-
+async def test_only_current_winners_hold_a_tier(winning_giveaway) -> None:
+    gid = await winning_giveaway("unique", 1001)
     tiers = [{"name": TIER, "count": 1}]
     assert await prize_service.won_tiers(gid, 1001, tiers) == [TIER]
     assert await prize_service.won_tiers(gid, 9999, tiers) == []
@@ -117,10 +129,10 @@ def test_claim_keyboard_only_exists_for_self_service_giveaways() -> None:
 
 @pytest.mark.asyncio
 async def test_claim_one_sends_the_code_and_warns_the_host_once(
-    bot, sessionmaker, new_giveaway
+    bot, winning_giveaway
 ) -> None:
     prize_handlers._warned.clear()
-    gid = await new_giveaway(prize_mode="unique")
+    gid = await winning_giveaway("unique", 1001, 1002, 1003)
     await prize_service.add_codes(gid, TIER, ["CODE-9"])
 
     status = await prize_handlers._claim_one(

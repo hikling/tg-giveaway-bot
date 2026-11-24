@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime
 
 from aiogram import Bot, F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -173,8 +174,14 @@ async def _accept_codes(message: Message, state: FSMContext, lang: str) -> None:
     index = int(data["codes_index"])
     tier = data["prizes"][index]
     buffer = list(data.get("codes_buffer", []))
+    pending = list(data.get("codes_pending", []))
+    if data.get("prize_mode") == "unique":
+        prior = {code for _, codes in buffer for code in codes}
+        if prior.intersection(pending):
+            await message.answer(t("prize.duplicate_tiers", lang))
+            return
     # 当前档只写入一次；重复按钮会被新的凭据和状态拒绝。
-    buffer.append([str(tier["name"]), list(data.get("codes_pending", []))])
+    buffer.append([str(tier["name"]), pending])
     await state.update_data(
         codes_buffer=buffer, codes_pending=[], codes_index=index + 1, prize_review_token=None
     )
@@ -195,6 +202,9 @@ def build_admin_create_router() -> Router:
     @serialize_draft
     async def on_new(message: Message, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer(t("prize.private_admin", lang))
+            return
         await state.clear()
         await state.update_data(prize_draft_owner=message.from_user.id)
         await state.set_state(GiveawayDraft.waiting_title)

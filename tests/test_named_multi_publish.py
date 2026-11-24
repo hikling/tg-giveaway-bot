@@ -158,6 +158,9 @@ async def test_all_posts_share_entry_and_draw_results_go_to_both_locations(sessi
     await begin(bot, gw.id)  # 从另一处抽奖帖点击，仍只有一条报名。
     async with sessionmaker() as session:
         assert await count_participants(session, gw.id) == 1
+        game = await session.get(Giveaway, gw.id)
+        game.end_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
     await finalize_and_publish(gw.id, bot)
     notices = [(chat, kw) for chat, text, kw in bot.sent if "中奖名单" in text]
     assert {chat for chat, _ in notices} == {-100111, -100222}
@@ -197,6 +200,10 @@ async def test_initial_posting_prevents_early_entry_or_early_draw(sessionmaker):
     gw = await new_multi_game()
     _, query = await begin(bot, gw.id)
     assert "正在发布" in query.answer.await_args.args[0]
+    async with sessionmaker() as session:
+        game = await session.get(Giveaway, gw.id)
+        game.end_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
     await finalize_and_publish(gw.id, bot)
     async with sessionmaker() as session:
         assert (await session.get(Giveaway, gw.id)).status == GiveawayStatus.running

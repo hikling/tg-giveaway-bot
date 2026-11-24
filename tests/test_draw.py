@@ -12,16 +12,17 @@ from __future__ import annotations
 import pytest
 
 from bot.db.models import GiveawayStatus
+from bot.db.prize_repo import CLAIM_OK
 from bot.db.repo import (
     add_participant,
     ban_user,
     current_winner_ids,
     get_giveaway,
     list_winners,
-    pending_notifications,
     replace_tier_winners,
 )
 from bot.services import giveaway as gw_service
+from bot.services import prize as prize_service
 from bot.services.giveaway import RerollError, finalize_and_publish, reroll_tier
 
 
@@ -37,8 +38,40 @@ async def _status(sessionmaker, gid):
         return gw.status
 
 
-async def test_draw_awards_the_tier_and_finishes(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway(prize_tiers=[{"name": "Steam card", "count": 1}])
+@pytest.mark.parametrize("draw_mode", ["time", "either"])
+async def test_timer_before_deadline_does_not_draw(sessionmaker, new_giveaway, bot, draw_mode):
+    gid = await new_giveaway(
+        draw_mode=draw_mode, target_participants=2 if draw_mode == "either" else None
+    )
+    await gw_service.attach_message(gid, chat_id=-100123, message_id=42)
+    async with sessionmaker() as session:
+        await _join(session, gid, [1001])
+        await session.commit()
+
+    await finalize_and_publish(gid, bot)
+
+    assert await _status(sessionmaker, gid) == GiveawayStatus.running
+    async with sessionmaker() as session:
+        assert not await list_winners(session, gid)
+    assert bot.sent == []
+
+
+async def test_timer_cannot_close_a_count_only_giveaway(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway(draw_mode="count", target_participants=2)
+    async with sessionmaker() as session:
+        await _join(session, gid, [1001])
+        await session.commit()
+
+    await finalize_and_publish(gid, bot)
+
+    assert await _status(sessionmaker, gid) == GiveawayStatus.running
+    async with sessionmaker() as session:
+        assert not await list_winners(session, gid)
+    assert bot.sent == []
+
+
+async def test_draw_awards_the_tier_and_finishes(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway(prize_tiers=[{"name": "Steam card", "count": 1}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001, 1002, 1003])
         await session.commit()
@@ -54,9 +87,9 @@ async def test_draw_awards_the_tier_and_finishes(sessionmaker, new_giveaway, bot
 
 
 async def test_draw_publishes_under_the_post_and_dms_the_winner(
-    sessionmaker, new_giveaway, bot
+    sessionmaker, due_giveaway, bot
 ):
-    gid = await new_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001])
         await session.commit()
@@ -72,9 +105,9 @@ async def test_draw_publishes_under_the_post_and_dms_the_winner(
     assert "Key" in dms[0][1]
 
 
-async def test_one_user_cannot_win_two_tiers(sessionmaker, new_giveaway, bot):
+async def test_one_user_cannot_win_two_tiers(sessionmaker, due_giveaway, bot):
     """A cross-tier repeat used to be possible: there was no exclusion set."""
-    gid = await new_giveaway(
+    gid = await due_giveaway(
         prize_tiers=[
             {"name": "Gold", "count": 2},
             {"name": "Silver", "count": 2},
@@ -98,9 +131,9 @@ async def test_one_user_cannot_win_two_tiers(sessionmaker, new_giveaway, bot):
     assert tiers.count("Silver") == 1
 
 
-async def test_shortfall_is_announced_in_public(sessionmaker, new_giveaway, bot):
+async def test_shortfall_is_announced_in_public(sessionmaker, due_giveaway, bot):
     """P1-5: a shrinking tier used to be announced as fully awarded."""
-    gid = await new_giveaway(prize_tiers=[{"name": "Rare", "count": 3}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Rare", "count": 3}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001])
         await session.commit()
@@ -114,10 +147,10 @@ async def test_shortfall_is_announced_in_public(sessionmaker, new_giveaway, bot)
 
 
 async def test_blacklisted_participant_is_excluded_from_the_draw(
-    sessionmaker, new_giveaway, bot
+    sessionmaker, due_giveaway, bot
 ):
     """P1-3: a ban used to be checked only at join time."""
-    gid = await new_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001, 1002])
         await session.commit()
@@ -134,9 +167,9 @@ async def test_blacklisted_participant_is_excluded_from_the_draw(
 
 
 async def test_draw_with_no_participants_still_closes_the_giveaway(
-    sessionmaker, new_giveaway, bot
+    sessionmaker, due_giveaway, bot
 ):
-    gid = await new_giveaway()
+    gid = await due_giveaway()
     await gw_service.attach_message(gid, chat_id=-100123, message_id=7)
 
     await finalize_and_publish(gid, bot)
@@ -146,9 +179,9 @@ async def test_draw_with_no_participants_still_closes_the_giveaway(
     assert await _status(sessionmaker, gid) == GiveawayStatus.finished
 
 
-async def test_drawing_twice_does_nothing(sessionmaker, new_giveaway, bot):
+async def test_drawing_twice_does_nothing(sessionmaker, due_giveaway, bot):
     """The timer and a manual call must not produce two draws."""
-    gid = await new_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001, 1002])
         await session.commit()
@@ -189,8 +222,8 @@ async def test_reroll_refuses_a_cancelled_giveaway(
     assert str(exc.value) == "canceled"
 
 
-async def test_reroll_refuses_an_unknown_tier(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+async def test_reroll_refuses_an_unknown_tier(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001, 1002])
         await session.commit()
@@ -201,11 +234,34 @@ async def test_reroll_refuses_an_unknown_tier(sessionmaker, new_giveaway, bot):
     assert str(exc.value) == "no_such_tier"
 
 
+async def test_reroll_refuses_a_claimed_tier(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}], prize_mode="unique")
+    await prize_service.add_codes(gid, "Key", ["CODE-ONE", "CODE-TWO"])
+    async with sessionmaker() as session:
+        await _join(session, gid, [1001, 1002])
+        await session.commit()
+    await finalize_and_publish(gid, bot)
+    async with sessionmaker() as session:
+        winner = (await list_winners(session, gid))[0]
+    assert (await prize_service.claim(gid, winner.user_id, "Key")).status == CLAIM_OK
+    sent_before = len(bot.sent)
+
+    with pytest.raises(RerollError, match="^claimed$"):
+        await reroll_tier(gid, "Key", bot)
+
+    async with sessionmaker() as session:
+        assert await current_winner_ids(session, gid) == {winner.user_id}
+        assert len(await list_winners(session, gid, include_replaced=True)) == 1
+    stock = await prize_service.stock(gid)
+    assert stock["Key"].remaining == 1
+    assert len(bot.sent) == sent_before
+
+
 async def test_reroll_replaces_and_keeps_the_old_draw(
-    sessionmaker, new_giveaway, bot
+    sessionmaker, due_giveaway, bot
 ):
     """P1-4: the audit trail is kept, the live result is replaced."""
-    gid = await new_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
     async with sessionmaker() as session:
         await _join(session, gid, [1001, 1002, 1003])
         await session.commit()
@@ -227,15 +283,15 @@ async def test_reroll_replaces_and_keeps_the_old_draw(
     assert live[0].replaced_at is None
     superseded = [w for w in history if w.replaced_at is not None]
     assert len(superseded) == 1, "the old draw is stamped, not deleted"
-    assert superseded[0].user_id in {1001, 1002, 1003}
+    assert {superseded[0].user_id} == first
     assert live[0].user_id in {1001, 1002, 1003}
 
 
 async def test_reroll_never_rewards_the_same_person_twice(
-    sessionmaker, new_giveaway, bot
+    sessionmaker, due_giveaway, bot
 ):
     """Rerolling tier A must not hand a live winner of tier B another win."""
-    gid = await new_giveaway(
+    gid = await due_giveaway(
         prize_tiers=[
             {"name": "Gold", "count": 1},
             {"name": "Silver", "count": 1},
@@ -265,9 +321,9 @@ async def test_reroll_never_rewards_the_same_person_twice(
 
 
 async def test_reroll_reports_a_shortfall_when_the_pool_is_tiny(
-    sessionmaker, new_giveaway, bot
+    sessionmaker, due_giveaway, bot
 ):
-    gid = await new_giveaway(
+    gid = await due_giveaway(
         prize_tiers=[{"name": "Gold", "count": 1}, {"name": "Silver", "count": 1}]
     )
     async with sessionmaker() as session:

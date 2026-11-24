@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import logging
+from html import unescape
 
 from aiogram import Bot, F, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from bot.callbacks.factories import ClaimCb, PrizeDraftCb
 from bot.db.base import get_sessionmaker
-from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_OK
+from bot.db.models import GiveawayStatus
+from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_INELIGIBLE, CLAIM_OK
 from bot.db.repo import get_giveaway
 from bot.filters.admin import IsAdmin
 from bot.handlers.common import lang_of
 from bot.i18n import t
 from bot.services import prize as prize_service
+from bot.utils.esc import telegram_text_length
 from bot.utils.prize_input import (
     ACCEPT_TEXTS,
     RESET_TEXTS,
@@ -26,6 +31,13 @@ from bot.utils.prize_input import (
 )
 
 log = logging.getLogger("bot.handlers.prize")
+
+_DELIVERY_FAILED = "delivery_failed"
+_CLAIM_FEEDBACK = {
+    CLAIM_ALREADY: "prize.already",
+    CLAIM_INELIGIBLE: "prize.not_winner",
+    _DELIVERY_FAILED: "prize.dm_failed",
+}
 
 
 class AddCodesDraft(StatesGroup):
@@ -53,8 +65,15 @@ async def _warn_creator(bot: Bot, giveaway_id: int, creator_id: int, tier: str) 
         log.warning("could not warn creator %s about empty stock", creator_id)
 
 
-async def _deliver_code(bot: Bot, user_id: int, lang: str, code: str) -> None:
-    await bot.send_message(user_id, t("prize.claimed", lang, code=code))
+async def _send_prize_text(bot: Bot, user_id: int, text: str) -> None:
+    # Prize translations contain plain text with HTML-escaped values. Preserve
+    # the complete prize as a file if it won't fit in one Telegram message.
+    if telegram_text_length(text) > 4096:
+        await bot.send_document(
+            user_id, BufferedInputFile(unescape(text).encode("utf-8"), filename="prizes.txt")
+        )
+        return
+    await bot.send_message(user_id, text, link_preview_options={"is_disabled": True})
 
 
 async def _claim_one(
@@ -63,9 +82,17 @@ async def _claim_one(
     """Attempt one claim and message the user; returns the outcome status."""
     outcome = await prize_service.claim(giveaway_id, user_id, tier)
     if outcome.status == CLAIM_OK and outcome.code:
-        await _deliver_code(bot, user_id, lang, outcome.code)
+        try:
+            await _send_prize_text(bot, user_id, t("prize.claimed", lang, code=outcome.code))
+        except TelegramAPIError:
+            # The committed claim remains available in the winner's private history.
+            log.warning("奖品私信发送失败，抽奖 %s，用户 %s", giveaway_id, user_id)
+            return _DELIVERY_FAILED
     elif outcome.status == CLAIM_EMPTY:
-        await bot.send_message(user_id, t("prize.empty", lang))
+        try:
+            await bot.send_message(user_id, t("prize.empty", lang))
+        except TelegramAPIError:
+            log.warning("无法向用户 %s 发送奖池缺货提醒", user_id)
         await _warn_creator(bot, giveaway_id, creator_id, tier)
     return outcome.status
 
@@ -86,6 +113,9 @@ def build_prize_router() -> Router:
         if gw is None:
             await cq.answer(t("prize.unknown", lang), show_alert=True)
             return
+        if gw.status != GiveawayStatus.finished:
+            await cq.answer(t("prize.not_drawn", lang), show_alert=True)
+            return
         if gw.prize_mode == "none":
             await cq.answer(t("prize.none_mode", lang), show_alert=True)
             return
@@ -96,11 +126,6 @@ def build_prize_router() -> Router:
             return
         tier_name = str(tier.get("name"))
 
-        held = await prize_service.won_tiers(gid, uid, gw.prize_tiers or [])
-        if tier_name not in held:
-            await cq.answer(t("prize.not_winner", lang), show_alert=True)
-            return
-
         status = await _claim_one(
             bot,
             lang,
@@ -109,8 +134,8 @@ def build_prize_router() -> Router:
             tier=tier_name,
             creator_id=gw.creator_id,
         )
-        if status == CLAIM_ALREADY:
-            await cq.answer(t("prize.already", lang), show_alert=True)
+        if key := _CLAIM_FEEDBACK.get(status):
+            await cq.answer(t(key, lang), show_alert=True)
         else:
             await cq.answer()
 
@@ -130,6 +155,9 @@ def build_prize_router() -> Router:
         if gw is None:
             await message.answer(t("prize.unknown", lang))
             return
+        if gw.status != GiveawayStatus.finished:
+            await message.answer(t("prize.not_drawn", lang))
+            return
         if gw.prize_mode == "none":
             await message.answer(t("prize.none_mode", lang))
             return
@@ -139,7 +167,7 @@ def build_prize_router() -> Router:
             await message.answer(t("prize.not_winner", lang))
             return
 
-        delivered = 0
+        statuses = set()
         for tier_name in held:
             status = await _claim_one(
                 bot,
@@ -149,15 +177,20 @@ def build_prize_router() -> Router:
                 tier=tier_name,
                 creator_id=gw.creator_id,
             )
-            if status == CLAIM_OK:
-                delivered += 1
-        if delivered == 0:
-            await message.answer(t("prize.already", lang))
+            statuses.add(status)
+        if _DELIVERY_FAILED in statuses:
+            await message.answer(t("prize.dm_failed", lang))
+        elif statuses.isdisjoint({CLAIM_OK, CLAIM_EMPTY}):
+            key = "prize.already" if CLAIM_ALREADY in statuses else "prize.not_winner"
+            await message.answer(t(key, lang))
 
     @router.message(Command("myprizes"))
-    async def on_myprizes(message: Message) -> None:
+    async def on_myprizes(message: Message, bot: Bot) -> None:
         uid = message.from_user.id
         lang = await lang_of(uid)
+        if message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
+            await message.answer(t("prize.private_history", lang))
+            return
         rows = await prize_service.claimed_by(uid)
         if not rows:
             await message.answer(t("prize.myprizes_empty", lang))
@@ -174,26 +207,28 @@ def build_prize_router() -> Router:
                     code=row.code,
                 )
             )
-        await message.answer("\n\n".join(lines))
+        await _send_prize_text(bot, uid, "\n\n".join(lines))
 
     return router
 
 
 async def _show_stock_review(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
+    pending = list(data.get("stock_pending", []))
+    count = await prize_service.new_stock_count(data["gid"], data["stock_mode"], pending)
     owner = data.get("prize_draft_owner", message.from_user.id)
     controls = await review_controls(state, owner, "stock")
     await state.set_state(AddCodesDraft.waiting_review)
-    await message.answer(
-        t(
-            "prize.stock_review",
-            id=data["gid"],
-            tier=data["tier"],
-            count=len(data.get("stock_pending", [])),
-            kind="份共享文本" if data.get("stock_mode") == "shared" else "条独立码",
-        ),
-        reply_markup=controls,
+    text = t(
+        "prize.stock_review",
+        id=data["gid"],
+        tier=data["tier"],
+        count=count,
+        kind="份共享文本" if data.get("stock_mode") == "shared" else "条独立码",
     )
+    if count < len(pending):
+        text += "\n\n" + t("prize.stock_duplicates", count=len(pending) - count)
+    await message.answer(text, reply_markup=controls)
 
 
 async def _reset_stock_draft(message: Message, state: FSMContext) -> None:
@@ -206,6 +241,7 @@ async def _reset_stock_draft(message: Message, state: FSMContext) -> None:
 async def _accept_stock(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     gid, tier = int(data["gid"]), data["tier"]
+    pending = list(data.get("stock_pending", []))
     async with get_sessionmaker()() as session:
         gw = await get_giveaway(session, gid)
     if gw is None or gw.prize_mode == "none":
@@ -215,11 +251,14 @@ async def _accept_stock(message: Message, state: FSMContext) -> None:
     added = await prize_service.add_codes(
         gid,
         tier,
-        list(data.get("stock_pending", [])),
+        pending,
         max_claims=prize_service.max_claims_for(gw.prize_mode),
     )
     await state.clear()
-    await message.answer(t("prize.addcodes_ok", id=gid, tier=tier, count=added))
+    text = t("prize.addcodes_ok", id=gid, tier=tier, count=added)
+    if added < len(pending):
+        text += "\n\n" + t("prize.stock_duplicates", count=len(pending) - added)
+    await message.answer(text)
 
 
 def build_prize_admin_router() -> Router:
@@ -258,6 +297,9 @@ def build_prize_admin_router() -> Router:
     @serialize_draft
     async def on_addcodes(message: Message, command: CommandObject, state: FSMContext) -> None:
         lang = await lang_of(message.from_user.id)
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer(t("prize.private_admin", lang))
+            return
         parts = (command.args or "").split(None, 1)
         if len(parts) < 2:
             await message.answer(t("prize.addcodes_usage", lang))

@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayCreationRequest, GiveawayPost, GiveawayStatus
-from bot.db.prize_repo import SHARED_CAP
+from bot.db.prize_repo import SHARED_CAP, has_claim
 from bot.db.prize_repo import add_codes as store_codes
 from bot.db.repo import (
     GiveawayView,
@@ -27,8 +27,9 @@ from bot.db.repo import (
     replace_tier_winners,
     set_giveaway_message,
 )
-from bot.services.notifier import publish_winners
+from bot.services.notifier import publish_winners, winner_delivery_lock
 from bot.utils.antiabuse import draw_indices, make_commit
+from bot.utils.prize_input import normalize_codes
 from bot.utils.rng import sample_winners
 
 log = logging.getLogger("bot.services.giveaway")
@@ -83,13 +84,15 @@ async def create(
         for chat_id, label in dict(destinations or []).items():
             session.add(GiveawayPost(giveaway_id=gw.id, chat_id=chat_id, label=label))
         for tier_name, codes in initial_codes or []:
-            await store_codes(
+            added = await store_codes(
                 session,
                 gw.id,
                 tier_name,
                 codes,
                 max_claims=SHARED_CAP if prize_mode == "shared" else 1,
             )
+            if prize_mode == "unique" and added < len(normalize_codes(codes)):
+                raise ValueError("同一场抽奖的多个奖项不能录入同一个独立码。")
         if request_id is not None:
             session.add(
                 GiveawayCreationRequest(
@@ -188,10 +191,18 @@ async def reroll_tier(
     win every tier and the same tier could be "rerolled" into itself.  Now:
 
     * only a finished giveaway may be rerolled;
+    * a tier whose prize has been claimed cannot be rerolled;
     * the previous draw is stamped ``replaced_at`` (audit trail kept);
     * current winners of other tiers are excluded;
     * blacklisted users are excluded.
     """
+    async with winner_delivery_lock(giveaway_id):
+        return await _reroll_tier(giveaway_id, tier_name, bot)
+
+
+async def _reroll_tier(
+    giveaway_id: int, tier_name: str, bot: Bot
+) -> tuple[list[tuple[int, str]], TierShortfall | None]:
     sm = get_sessionmaker()
     async with sm() as session:
         gw = await claim_giveaway(session, giveaway_id, GiveawayStatus.finished)
@@ -204,6 +215,8 @@ async def reroll_tier(
         count = _tier_count(gw.prize_tiers, tier_name)
         if count <= 0:
             raise RerollError("no_such_tier")
+        if await has_claim(session, giveaway_id=giveaway_id, tier_name=tier_name):
+            raise RerollError("claimed")
 
         participants = await list_participants(session, giveaway_id, verified_only=True)
         if not participants:
@@ -283,7 +296,7 @@ async def draw_if_full(session: AsyncSession, gid: int) -> DrawResult | None:
         gw is None
         or gw.status != GiveawayStatus.running
         or gw.publishing
-        or gw.draw_mode == "time"
+        or gw.draw_mode not in {"count", "either"}
         or not gw.target_participants
     ):
         return None
@@ -294,6 +307,7 @@ async def draw_if_full(session: AsyncSession, gid: int) -> DrawResult | None:
 
 
 async def publish_draw(bot: Bot, result: DrawResult) -> None:
+    """Publish a committed result while holding its winner delivery lock."""
     await publish_winners(
         bot,
         result.giveaway,
@@ -304,23 +318,29 @@ async def publish_draw(bot: Bot, result: DrawResult) -> None:
 
 
 async def finalize_and_publish(giveaway_id: int, bot: Bot) -> None:
-    async with get_sessionmaker()() as session:
-        gw = await claim_giveaway(
-            session, giveaway_id, GiveawayStatus.running, new_status=GiveawayStatus.finished
-        )
-        if gw is None or gw.publishing:
-            return
-        result = await _draw_locked(session, gw)
-        await session.commit()
-    await publish_draw(bot, result)
+    async with winner_delivery_lock(giveaway_id):
+        async with get_sessionmaker()() as session:
+            gw = await claim_giveaway(session, giveaway_id, GiveawayStatus.running)
+            # Recheck the stored deadline after obtaining the write lock.
+            if (
+                gw is None
+                or gw.publishing
+                or (gw.draw_mode or "time") not in {"time", "either"}
+                or gw.end_at > datetime.now(UTC)
+            ):
+                return
+            result = await _draw_locked(session, gw)
+            await session.commit()
+        await publish_draw(bot, result)
 
 
 async def restore_count_draw(giveaway_id: int, bot: Bot) -> None:
-    async with get_sessionmaker()() as session:
-        gw = await claim_giveaway(session, giveaway_id, GiveawayStatus.running)
-        if gw is None:
-            return
-        result = await draw_if_full(session, giveaway_id)
-        await session.commit()
-    if result:
-        await publish_draw(bot, result)
+    async with winner_delivery_lock(giveaway_id):
+        async with get_sessionmaker()() as session:
+            gw = await claim_giveaway(session, giveaway_id, GiveawayStatus.running)
+            if gw is None:
+                return
+            result = await draw_if_full(session, giveaway_id)
+            await session.commit()
+        if result:
+            await publish_draw(bot, result)

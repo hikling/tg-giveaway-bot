@@ -16,7 +16,7 @@ from bot.db.models import Giveaway, GiveawayStatus, PoetryAttempt
 from bot.db.repo import add_participant, count_participants, list_winners
 from bot.poetry import POEMS
 from bot.services import giveaway as giveaways
-from bot.services import poetry
+from bot.services import poetry, prize
 from bot.services.channels import missing_channels, parse_requirements, validate_channels
 from bot.services.scheduler import GiveawayScheduler
 from bot.utils.timeparse import COUNT_ONLY_END, format_draw_condition, parse_draw_condition
@@ -143,7 +143,10 @@ def test_invalid_draw_conditions(text):
 
 
 async def test_full_count_draws_only_after_successful_answers(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway(draw_mode="count", target_participants=2, end_at=COUNT_ONLY_END)
+    gid = await new_giveaway(
+        draw_mode="count", target_participants=2, end_at=COUNT_ONLY_END, prize_mode="unique"
+    )
+    await prize.add_codes(gid, "Steam card", ["UNIQUE-VOUCHER-TEST"])
     first, _ = await begin(bot, gid, 1001)
     second, _ = await begin(bot, gid, 1002)
     # 仅点击参加、看到题目不计报名人数。
@@ -153,6 +156,7 @@ async def test_full_count_draws_only_after_successful_answers(sessionmaker, new_
     async with sessionmaker() as session:
         assert (await session.get(Giveaway, gid)).status == GiveawayStatus.running
         assert not await list_winners(session, gid)
+    assert all("恭喜" not in message for message in bot.texts())
     await choose(bot, second, correct=False, uid=1002)
     async with sessionmaker() as session:
         assert (await session.get(Giveaway, gid)).status == GiveawayStatus.running
@@ -162,6 +166,9 @@ async def test_full_count_draws_only_after_successful_answers(sessionmaker, new_
         assert await count_participants(session, gid) == 2
         assert (await session.get(Giveaway, gid)).status == GiveawayStatus.finished
         assert len(await list_winners(session, gid)) == 1
+    assert sum("恭喜" in message for message in bot.texts()) == 1
+    assert all("UNIQUE-VOUCHER-TEST" not in message for message in bot.texts())
+    assert (await prize.stock(gid))["Steam card"].claimed == 0
 
 
 async def test_concurrent_answers_do_not_overfill_or_draw_twice(sessionmaker, new_giveaway, bot):
@@ -170,7 +177,7 @@ async def test_concurrent_answers_do_not_overfill_or_draw_twice(sessionmaker, ne
     await asyncio.gather(
         *(
             choose(bot, entry[0], correct=True, uid=uid)
-            for uid, entry in zip(range(1001, 1005), challenges)
+            for uid, entry in zip(range(1001, 1005), challenges, strict=True)
         )
     )
     async with sessionmaker() as session:
@@ -232,6 +239,10 @@ async def test_either_mode_draws_once_when_first_condition_is_reached(
         await choose(bot, challenge, correct=True)
         await giveaways.finalize_and_publish(gid, bot)
     else:
+        async with sessionmaker() as session:
+            game = await session.get(Giveaway, gid)
+            game.end_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
         await giveaways.finalize_and_publish(gid, bot)
         await choose(bot, challenge, correct=True)
     async with sessionmaker() as session:

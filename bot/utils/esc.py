@@ -17,6 +17,7 @@ Two rules make this safe without sprinkling ``html.escape`` at 40 call sites:
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
 
@@ -37,6 +38,12 @@ def esc(value: Any) -> str:
 
 def esc_list(values: Any, sep: str = "\n") -> str:
     return sep.join(esc(v) for v in (values or []))
+
+
+def telegram_text_length(text: str) -> int:
+    """Measure visible text in an HTML-formatted Telegram message."""
+    plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return len(plain_text.encode("utf-16-le")) // 2
 
 
 def user_mention(user_id: int, label: str | None = None) -> Raw:

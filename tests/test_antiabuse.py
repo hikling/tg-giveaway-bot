@@ -114,7 +114,7 @@ async def test_the_announcement_reveals_the_seed(sessionmaker, bot) -> None:
         description="",
         prize_tiers=[{"name": "Gold", "count": 1}],
         required_channels=[],
-        end_at=datetime.now(UTC) + timedelta(hours=1),
+        end_at=datetime.now(UTC) - timedelta(seconds=1),
         turnstile_required=False,
     )
     gid = gw.id

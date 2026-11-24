@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -20,7 +21,7 @@ from bot.db.models import (
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +56,7 @@ class GiveawayView:
     target_participants: int | None = None
 
     @classmethod
-    def of(cls, gw: Giveaway) -> "GiveawayView":
+    def of(cls, gw: Giveaway) -> GiveawayView:
         return cls(
             id=gw.id,
             creator_id=gw.creator_id,
@@ -224,7 +225,7 @@ async def update_giveaway_status(
 async def claim_giveaway(
     session: AsyncSession,
     giveaway_id: int,
-    expected_status: GiveawayStatus,
+    expected_status: GiveawayStatus | None,
     *,
     new_status: GiveawayStatus | None = None,
     require_open: bool = False,
@@ -235,7 +236,9 @@ async def claim_giveaway(
     The lock lasts until commit/rollback. A status transition and its winner
     rows therefore succeed together, even when multiple workers draw at once.
     """
-    stmt = update(Giveaway).where(Giveaway.id == giveaway_id, Giveaway.status == expected_status)
+    stmt = update(Giveaway).where(Giveaway.id == giveaway_id)
+    if expected_status is not None:
+        stmt = stmt.where(Giveaway.status == expected_status)
     if require_open:
         stmt = stmt.where(
             or_(Giveaway.draw_mode == "count", Giveaway.end_at > _now()),

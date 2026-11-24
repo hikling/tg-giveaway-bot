@@ -30,6 +30,7 @@ class Message:
     def __init__(self, text="", uid=ADMIN):
         self.text = text
         self.from_user = SimpleNamespace(id=uid)
+        self.chat = SimpleNamespace(id=uid, type="private")
         self.responses = []
 
     async def answer(self, text, **kwargs):
@@ -49,6 +50,21 @@ def context(uid=ADMIN):
     return FSMContext(
         storage=MemoryStorage(), key=StorageKey(bot_id=777000, chat_id=uid, user_id=uid)
     )
+
+
+async def test_group_commands_do_not_open_a_prize_draft(sessionmaker):
+    message = Message("/newgiveaway")
+    message.chat = SimpleNamespace(id=-1004351, type="supergroup")
+    state = context()
+
+    await handler("on_new")(message, state)
+    await handler("on_addcodes", stock=True)(
+        message, CommandObject(command="addcodes", args="1 一等奖"), state
+    )
+
+    assert await state.get_state() is None
+    assert len(message.responses) == 2
+    assert all("私聊" in text for text, _ in message.responses)
 
 
 async def setup_creation(*, mode="unique", tiers=None):

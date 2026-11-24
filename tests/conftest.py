@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -100,7 +100,7 @@ async def new_giveaway(sessionmaker):
             "description": "",
             "prize_tiers": [{"name": "Steam card", "count": 1}],
             "required_channels": [],
-            "end_at": datetime.now(timezone.utc) + timedelta(hours=1),
+            "end_at": datetime.now(UTC) + timedelta(hours=1),
             "turnstile_required": False,
         }
         params.update(overrides)
@@ -108,5 +108,14 @@ async def new_giveaway(sessionmaker):
             gw = await create_giveaway(session, **params)
             await session.commit()
             return gw.id
+
+    return _make
+
+
+@pytest.fixture
+def due_giveaway(new_giveaway):
+    async def _make(**overrides) -> int:
+        overrides.setdefault("end_at", datetime.now(UTC) - timedelta(seconds=1))
+        return await new_giveaway(**overrides)
 
     return _make

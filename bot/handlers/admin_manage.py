@@ -139,6 +139,7 @@ def build_admin_manage_router() -> Router:
                 "running": "admin.reroll_running",
                 "canceled": "admin.reroll_canceled",
                 "no_such_tier": "admin.reroll_no_tier",
+                "claimed": "admin.reroll_claimed",
             }.get(str(exc), "admin.reroll_empty")
             await message.answer(t(key, lang, id=gid, tier=esc(tier)))
             return

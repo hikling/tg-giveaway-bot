@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Sequence
+from collections.abc import Iterator, Sequence
+from weakref import WeakValueDictionary
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.callbacks.factories import ClaimCb
 from bot.db.base import get_sessionmaker
+from bot.db.models import GiveawayStatus
 from bot.db.repo import (
     GiveawayView,
     TierShortfall,
@@ -17,11 +20,32 @@ from bot.db.repo import (
 )
 from bot.i18n import t
 from bot.settings import get_settings
-from bot.utils.esc import esc, user_mention
+from bot.utils.esc import esc, telegram_text_length, user_mention
 
 log = logging.getLogger("bot.services.notifier")
 
 NL = "\n"
+_winner_delivery_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+
+
+def winner_delivery_lock(giveaway_id: int) -> asyncio.Lock:
+    """Order draws, rerolls and retries for one giveaway in the bot process."""
+    return _winner_delivery_locks.setdefault(giveaway_id, asyncio.Lock())
+
+
+def _announcement_batches(lines: Sequence[str]) -> Iterator[str]:
+    batch: list[str] = []
+    size = 0
+    for line in lines:
+        length = telegram_text_length(line)
+        if batch and size + 1 + length > 4096:
+            yield NL.join(batch)
+            batch = []
+            size = 0
+        size = size + 1 + length if batch else length
+        batch.append(line)
+    if batch:
+        yield NL.join(batch)
 
 
 async def _winner_langs(session, winner_ids: Sequence[int]) -> dict[int, str]:
@@ -70,7 +94,7 @@ async def publish_winners(
     reveal_round: int | None = None,
     pool_digest: str | None = None,
 ) -> None:
-    """Announce a draw under the original post and DM every winner.
+    """Announce and notify a committed draw while holding its delivery lock.
 
     ``giveaway`` is a frozen :class:`GiveawayView`, not a live ORM row —
     the caller has already left its session, and relying on
@@ -83,6 +107,8 @@ async def publish_winners(
     logged and forgotten, so a failed delivery left no trace and no way to
     retry selectively.
     """
+    if giveaway.status != GiveawayStatus.finished:
+        return
     default_lang = get_settings().default_lang
     winner_langs: dict[int, str] = {}
     creator_username: str | None = None
@@ -138,21 +164,22 @@ async def publish_winners(
                 missing=short.missing,
             )
         )
-    text = NL.join(lines)
+    messages = list(_announcement_batches(lines))
 
     from bot.services.publication import post_locations
 
     for chat_id, message_id in await post_locations(
         giveaway.id, giveaway.chat_id, giveaway.message_id
     ):
-        try:
-            await bot.send_message(
-                chat_id,
-                text,
-                reply_to_message_id=message_id,
-            )
-        except Exception:
-            log.exception("publish_winners: send_message failed")
+        for text in messages:
+            try:
+                await bot.send_message(
+                    chat_id,
+                    text,
+                    reply_to_message_id=message_id,
+                )
+            except Exception:
+                log.exception("publish_winners: send_message failed")
 
     # 2. private winner notifications, each with a persisted outcome
     for user_id, tier in winners:
@@ -207,15 +234,22 @@ async def retry_pending(bot: Bot, giveaway_id: int) -> int:
     Includes both unattempted and failed current winners. Returns the
     number of messages actually sent; superseded winners are never retried.
     """
+    async with winner_delivery_lock(giveaway_id):
+        return await _retry_pending(bot, giveaway_id)
+
+
+async def _retry_pending(bot: Bot, giveaway_id: int) -> int:
     from bot.db.repo import pending_notifications
 
     sm = get_sessionmaker()
     async with sm() as session:
-        rows = await pending_notifications(session, giveaway_id)
         giveaway = await get_giveaway_view(session, giveaway_id)
+        if giveaway is None or giveaway.status != GiveawayStatus.finished:
+            return 0
+        rows = await pending_notifications(session, giveaway_id)
         langs = await _winner_langs(session, [r.user_id for r in rows])
         jobs = [(r.id, r.user_id, r.tier_name) for r in rows]
-    if giveaway is None or not jobs:
+    if not jobs:
         return 0
 
     default_lang = get_settings().default_lang

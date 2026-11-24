@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from html import unescape
 from typing import Annotated, Literal
 
 from aiohttp import web
@@ -21,6 +20,7 @@ from bot.services.channels import (
     resolve_publication_targets,
 )
 from bot.services.publication import publish_all
+from bot.utils.esc import telegram_text_length
 from bot.utils.prize_input import parse_input
 from bot.utils.render import render
 from bot.utils.timeparse import format_draw_condition, parse_draw_condition
@@ -93,12 +93,17 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
         raise AdminError("奖项名称不能重复。")
     tiers = [{"name": tier.name, "count": tier.count} for tier in draft.tiers]
     inventory = []
+    unique_codes: set[str] = set()
     for tier in draft.tiers:
         codes = [] if draft.prize_mode == "none" else parse_input(tier.codes, draft.prize_mode)
         try:
             validate_prize_content(codes)
         except AdminError as exc:
             raise AdminError(f"「{tier.name}」：{exc}") from exc
+        if draft.prize_mode == "unique":
+            if unique_codes.intersection(codes):
+                raise AdminError(f"「{tier.name}」与其他奖项有重复的独立码，请核对。")
+            unique_codes.update(codes)
         inventory.append((tier.name, codes))
     try:
         channels = parse_requirements(draft.channels)
@@ -120,8 +125,7 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
         count=0,
         commit="0" * 64,
     )
-    visible_post = unescape(re.sub(r"<[^>]+>", "", post))
-    if len(visible_post.encode("utf-16-le")) // 2 > 4096:
+    if telegram_text_length(post) > 4096:
         raise AdminError("抽奖帖超过 Telegram 的长度限制，请缩短说明或精简奖项。")
     try:
         destinations = await resolve_publication_targets(request.app["bot"], channels, groups)

@@ -7,18 +7,21 @@ fakes. These cases are intentionally not executed during the static repair.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from bot.callbacks.factories import JoinCb
+from bot.db import repo
 from bot.db.models import GiveawayStatus
 from bot.db.repo import (
     add_participant,
     count_participants,
     get_giveaway,
     list_winners,
+    log_winners,
     pending_notifications,
     replace_tier_winners,
 )
@@ -26,8 +29,9 @@ from bot.handlers import participate
 from bot.main import _configure_delivery
 from bot.services import giveaway as gw_service
 from bot.services.channels import missing_channels, validate_channels
-from bot.services.notifier import retry_pending
+from bot.services.notifier import retry_pending, winner_delivery_lock
 from bot.settings import Settings
+from bot.utils.esc import telegram_text_length
 
 
 @pytest.mark.parametrize(
@@ -45,8 +49,8 @@ def test_admin_ids_from_environment(monkeypatch, value, expected):
     assert settings.admin_ids == expected
 
 
-async def test_concurrent_draws_produce_one_result(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway()
+async def test_concurrent_draws_produce_one_result(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway()
     async with sessionmaker() as session:
         await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
         await session.commit()
@@ -59,13 +63,35 @@ async def test_concurrent_draws_produce_one_result(sessionmaker, new_giveaway, b
     assert len([m for m in bot.sent if m[0] == 1001]) == 1
 
 
+async def test_long_winner_announcement_is_split_without_losing_winners(
+    sessionmaker, due_giveaway, bot
+):
+    members = range(1001, 1071)
+    gid = await due_giveaway(prize_tiers=[{"name": "奖" * 64, "count": len(members)}])
+    async with sessionmaker() as session:
+        for user_id in members:
+            await add_participant(session, giveaway_id=gid, user_id=user_id, username=None)
+        await session.commit()
+    await gw_service.attach_message(gid, chat_id=-100123, message_id=7)
+
+    await gw_service.finalize_and_publish(gid, bot)
+
+    public_posts = [(message, args) for chat, message, args in bot.sent if chat == -100123]
+    assert len(public_posts) > 1
+    for message, args in public_posts:
+        assert telegram_text_length(message) <= 4096
+        assert args["reply_to_message_id"] == 7
+    announcement = "\n".join(message for message, _ in public_posts)
+    assert all(announcement.count(f'tg://user?id={user_id}"') == 1 for user_id in members)
+
+
 async def test_failed_draw_rolls_back_its_status_claim(
     sessionmaker,
-    new_giveaway,
+    due_giveaway,
     bot,
     monkeypatch,
 ):
-    gid = await new_giveaway()
+    gid = await due_giveaway()
     monkeypatch.setattr(
         gw_service, "log_winners", AsyncMock(side_effect=RuntimeError("disk failure"))
     )
@@ -97,8 +123,8 @@ async def test_required_channel_needs_bot_admin_permissions(bot):
     assert not await validate_channels(bot, ["@required"])
 
 
-async def test_failed_winner_dm_can_be_retried(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway()
+async def test_failed_winner_dm_can_be_retried(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway()
     async with sessionmaker() as session:
         await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
         await session.commit()
@@ -113,8 +139,59 @@ async def test_failed_winner_dm_can_be_retried(sessionmaker, new_giveaway, bot):
         assert not await pending_notifications(session, gid)
 
 
-async def test_superseded_failed_winner_is_not_retried(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway()
+async def test_retry_waits_for_initial_winner_dm(sessionmaker, due_giveaway, bot, monkeypatch):
+    gid = await due_giveaway()
+    async with sessionmaker() as session:
+        await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
+        await session.commit()
+
+    send_started = asyncio.Event()
+    finish_send = asyncio.Event()
+    retry_waiting = asyncio.Event()
+    send_message = bot.send_message
+    delivery_lock = winner_delivery_lock(gid)
+    acquire = delivery_lock.acquire
+
+    async def blocked_send(chat_id, text, **kwargs):
+        send_started.set()
+        await finish_send.wait()
+        await send_message(chat_id, text, **kwargs)
+
+    async def observe_acquire():
+        if delivery_lock.locked():
+            retry_waiting.set()
+        return await acquire()
+
+    monkeypatch.setattr(bot, "send_message", blocked_send)
+    monkeypatch.setattr(delivery_lock, "acquire", observe_acquire)
+
+    async with asyncio.timeout(10), asyncio.TaskGroup() as tasks:
+        tasks.create_task(gw_service.finalize_and_publish(gid, bot))
+        await send_started.wait()
+        retry = tasks.create_task(retry_pending(bot, gid))
+        await retry_waiting.wait()
+        finish_send.set()
+
+    assert retry.result() == 0
+    assert [chat_id for chat_id, _, _ in bot.sent] == [1001]
+    async with sessionmaker() as session:
+        assert not await pending_notifications(session, gid)
+
+
+async def test_retry_ignores_legacy_winner_rows_before_draw(sessionmaker, new_giveaway, bot):
+    gid = await new_giveaway(prize_mode="unique")
+    async with sessionmaker() as session:
+        await log_winners(session, gid, [(1001, "Steam card")])
+        await session.commit()
+
+    assert await retry_pending(bot, gid) == 0
+    assert not bot.sent
+    async with sessionmaker() as session:
+        assert (await list_winners(session, gid))[0].notified_at is None
+
+
+async def test_superseded_failed_winner_is_not_retried(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway()
     async with sessionmaker() as session:
         await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
         await session.commit()
@@ -168,6 +245,18 @@ def _callback(bot):
         bot=bot,
         answer=AsyncMock(),
     )
+
+
+async def test_locked_eligibility_rechecks_deadline_after_waiting_for_writer(
+    sessionmaker, new_giveaway, monkeypatch
+):
+    now = datetime.now(UTC)
+    gid = await new_giveaway(end_at=now - timedelta(seconds=1))
+    # The conditional UPDATE captures the old time before the lock wait.
+    monkeypatch.setattr(repo, "_now", lambda: now - timedelta(minutes=1))
+
+    async with sessionmaker() as session:
+        assert await participate._locked_eligibility(session, gid, 1001) == "join.ended"
 
 
 async def test_cancel_during_channel_check_cannot_accept_an_entry(

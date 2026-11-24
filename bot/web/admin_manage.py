@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import re
-import weakref
 from typing import Literal
 
 from aiohttp import web
@@ -34,7 +32,6 @@ from bot.utils.timeparse import format_draw_condition
 from bot.web.admin_common import AdminError, read_payload, validate_prize_content
 
 _PAGE_SIZE = 25
-_retry_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 class GiveawayAction(BaseModel):
@@ -167,12 +164,21 @@ async def _stock_action(gw: Giveaway, payload: GiveawayAction, tier: str) -> dic
         raise AdminError("请填写奖品内容。")
     validate_prize_content(codes)
     if payload.action == "stock-preview":
+        count = await prize_service.new_stock_count(gw.id, gw.prize_mode, codes)
+        if not count:
+            raise AdminError("这些独立码已在本场奖池中，没有新奖品可入库。")
         unit = "份共享文本" if gw.prize_mode == "shared" else "条独立码"
-        return {"message": f"识别到 {len(codes)} {unit}。", "count": len(codes)}
+        message = f"识别到 {count} {unit}。"
+        if count < len(codes):
+            message += f" 已跳过 {len(codes) - count} 条重复独立码。"
+        return {"message": message, "count": count}
     count = await prize_service.add_codes(
         gw.id, tier, codes, max_claims=prize_service.max_claims_for(gw.prize_mode)
     )
-    return {"message": f"已为「{tier}」补充 {count} 份奖品。", "count": count}
+    message = f"已为「{tier}」补充 {count} 份奖品。"
+    if count < len(codes):
+        message += f" 已跳过 {len(codes) - count} 条重复独立码。"
+    return {"message": message, "count": count}
 
 
 async def giveaway_action(request: web.Request) -> web.Response:
@@ -191,9 +197,7 @@ async def giveaway_action(request: web.Request) -> web.Response:
         request.app["scheduler"].cancel(gid)
         return web.json_response({"message": f"抽奖 #{gid} 已取消。"})
     if action == "retry":
-        lock = _retry_locks.setdefault(gid, asyncio.Lock())
-        async with lock:
-            count = await retry_pending(bot, gid)
+        count = await retry_pending(bot, gid)
         return web.json_response({"message": f"成功补发 {count} 条中奖私信。", "count": count})
     if action == "republish":
         try:
@@ -219,6 +223,7 @@ async def giveaway_action(request: web.Request) -> web.Response:
                 "running": "抽奖结束后才能重抽。",
                 "canceled": "这场抽奖已取消，无法重抽。",
                 "no_such_tier": "抽奖中找不到这个奖项。",
+                "claimed": "这个奖项已有奖品被领取，无法重抽。",
             }.get(str(exc), "这场抽奖目前无法重抽。")
             raise AdminError(message, status=409) from exc
         count = len(picks)
