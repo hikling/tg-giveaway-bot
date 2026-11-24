@@ -230,3 +230,11 @@ class GiveawayPost(Base):
     label: Mapped[str] = mapped_column(String(128))
     message_id: Mapped[int | None] = mapped_column(BigInteger)
     send_error: Mapped[str | None] = mapped_column(String(128))
+
+
+class GiveawayCreationRequest(Base):
+    __tablename__ = "giveaway_creation_requests"
+
+    creator_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    giveaway_id: Mapped[int] = mapped_column(ForeignKey("giveaways.id", ondelete="CASCADE"))

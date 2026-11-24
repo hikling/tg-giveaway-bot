@@ -15,7 +15,11 @@ from bot.handlers.common import lang_of
 from bot.i18n import t
 from bot.keyboards.admin import admin_giveaway_panel
 from bot.services import giveaway as gw_service
-from bot.services.channels import linked_requirements, resolve_destinations, validate_channels
+from bot.services.channels import (
+    linked_requirements,
+    resolve_publication_targets,
+    validate_channels,
+)
 from bot.services.publication import publish_all
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
@@ -399,18 +403,15 @@ def build_admin_create_router() -> Router:
             return
         # 发布前重新检查权限并解析真实编号，相同目标的用户名/编号只发布一次。
         try:
-            problems = [
-                *await validate_channels(bot, data["channels"], expected_type="channel"),
-                *await validate_channels(bot, data.get("groups", []), expected_type="group"),
-            ]
-            targets = await resolve_destinations(bot, requirements)
+            targets = await resolve_publication_targets(
+                bot, data["channels"], data.get("groups", [])
+            )
+        except ValueError as exc:
+            await message.answer(t("fsm.publish_check_failed", lang) + "\n" + esc_list([str(exc)]))
+            return
         except Exception:
             await message.answer(t("fsm.publish_check_failed", lang))
             return
-        if problems:
-            await message.answer(t("fsm.publish_check_failed", lang) + "\n" + esc_list(problems))
-            return
-
         mode = str(data.get("prize_mode") or "none")
         try:
             gw = await gw_service.create(

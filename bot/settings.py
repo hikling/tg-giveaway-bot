@@ -4,7 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     webhook_base_url: str = ""
+    mini_app_base_url: str = ""
     web_host: str = "127.0.0.1"
     web_port: int = 8080
     # Optional on purpose.  Long polling is the documented default path, but
@@ -65,6 +66,34 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("mini_app_base_url")
+    @classmethod
+    def _validate_mini_app_base_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value:
+            return ""
+        error = "MINI_APP_BASE_URL 必须是 HTTPS 站点地址，例如 https://giveaway.example.com"
+        try:
+            url = urlsplit(value)
+            port = url.port
+        except ValueError as exc:
+            raise ValueError(error) from exc
+        if (
+            url.scheme != "https"
+            or not url.hostname
+            or url.username is not None
+            or port == 0
+            or url.path
+            or url.query
+            or url.fragment
+            or any(char.isspace() for char in value)
+            or "?" in value
+            or "#" in value
+            or "\\" in value
+        ):
+            raise ValueError(error)
+        return value
 
     @model_validator(mode="after")
     def _webhook_requires_secret(self) -> Settings:

@@ -172,3 +172,15 @@ async def resolve_destinations(bot: Bot, entries: Sequence[str]) -> list[Destina
         if chat.id not in result:
             result[chat.id] = Destination(chat.id, display_requirement(raw))
     return list(result.values())
+
+
+async def resolve_publication_targets(
+    bot: Bot, channels: Sequence[str], groups: Sequence[str]
+) -> list[Destination]:
+    problems = [
+        *await validate_channels(bot, channels, expected_type="channel"),
+        *await validate_channels(bot, groups, expected_type="group"),
+    ]
+    if problems:
+        raise ValueError("\n".join(problems))
+    return await resolve_destinations(bot, [*channels, *groups])

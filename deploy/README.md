@@ -21,3 +21,11 @@ docker compose -f deploy/docker-compose.yml logs -f bot
 ```
 
 古诗词答题全部在机器人私聊内进行，无需配置 Cloudflare。
+
+## 管理员小程序
+
+1. 确保部署站点有有效的 HTTPS 证书。使用上面的 Docker 配置时，Caddy 会把小程序页面和接口一起转发给机器人服务。自行部署时，将 HTTPS 反向代理转发到机器人的 HTTP 监听地址。
+2. 在 `.env` 填写 `MINI_APP_BASE_URL=https://giveaway.example.com`。填写站点地址，程序会拼接 `/admin/`。使用现有 Docker 配置时，域名和启动时传入的 `DOMAIN` 一致。
+3. 重启服务，再用管理员账号在机器人私聊中点「抽奖管理」。机器人会为配置文件和数据库中的管理员设置菜单按钮。若管理员从未私聊过机器人，先点「开始」即可。
+
+`MINI_APP_BASE_URL` 和 `WEBHOOK_BASE_URL` 独立配置。小程序仍可用长轮询部署。退出并重新打开小程序可刷新已过期的 Telegram 登录信息。

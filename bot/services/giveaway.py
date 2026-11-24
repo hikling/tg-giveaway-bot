@@ -9,7 +9,7 @@ from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import get_sessionmaker
-from bot.db.models import Giveaway, GiveawayPost, GiveawayStatus
+from bot.db.models import Giveaway, GiveawayCreationRequest, GiveawayPost, GiveawayStatus
 from bot.db.prize_repo import SHARED_CAP
 from bot.db.prize_repo import add_codes as store_codes
 from bot.db.repo import (
@@ -50,6 +50,7 @@ async def create(
     publishing: bool = False,
     destinations: list[tuple[int, str]] | None = None,
     initial_codes: list[tuple[str, list[str]]] | None = None,
+    request_id: str | None = None,
 ) -> Giveaway:
     # Commit before the giveaway exists in public: the hash ships in the post,
     # the seed is only revealed with the winners, so the draw can be replayed.
@@ -88,6 +89,12 @@ async def create(
                 tier_name,
                 codes,
                 max_claims=SHARED_CAP if prize_mode == "shared" else 1,
+            )
+        if request_id is not None:
+            session.add(
+                GiveawayCreationRequest(
+                    creator_id=creator_id, request_id=request_id, giveaway_id=gw.id
+                )
             )
         await session.commit()
         return gw

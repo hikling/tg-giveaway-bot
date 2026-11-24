@@ -14,16 +14,16 @@ from bot.db.repo import (
     ban_user,
     count_participants,
     delete_participations,
-    is_admin_db,
     list_admins,
     list_giveaways_by_creator,
     list_participants,
     unban_user,
 )
-from bot.filters.admin import IsAdmin
+from bot.filters.admin import IsAdmin, is_admin
 from bot.handlers.common import lang_of
 from bot.i18n import t
 from bot.services import giveaway as gw_service
+from bot.services.admin_menu import set_admin_menu
 from bot.services.notifier import retry_pending
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
@@ -42,16 +42,6 @@ def _int_arg(text: str) -> int | None:
         return None
 
 
-async def _is_admin(user_id: int) -> bool:
-    """Same two-source check as IsAdmin, for callback handlers."""
-    settings = get_settings()
-    if user_id in settings.admin_ids:
-        return True
-    sm = get_sessionmaker()
-    async with sm() as session:
-        return await is_admin_db(session, user_id)
-
-
 def build_admin_manage_router() -> Router:
     router = Router(name="admin_manage")
     router.message.filter(IsAdmin())
@@ -67,7 +57,7 @@ def build_admin_manage_router() -> Router:
         # all, so the cancel button raised a callback timeout. Note that the
         # message filter above is message-only: aiogram does not carry it over
         # to callbacks, hence the explicit re-check.
-        if not await _is_admin(cq.from_user.id):
+        if not await is_admin(cq.from_user.id, get_settings().admin_ids):
             lang = await lang_of(cq.from_user.id)
             await cq.answer(t("common.not_admin", lang), show_alert=True)
             return
@@ -268,7 +258,7 @@ def build_admin_manage_router() -> Router:
         await message.answer(t("admin.unban_ok", lang, user_id=uid))
 
     @router.message(Command("addadmin"))
-    async def on_addadmin(message: Message, command: CommandObject) -> None:
+    async def on_addadmin(message: Message, command: CommandObject, bot: Bot) -> None:
         lang = await lang_of(message.from_user.id)
         uid = _int_arg(command.args or "")
         if uid is None:
@@ -279,6 +269,7 @@ def build_admin_manage_router() -> Router:
             await add_admin(session, uid, added_by=message.from_user.id)
             await session.commit()
         await message.answer(t("admin.addadmin_ok", lang, user_id=user_mention(uid)))
+        await set_admin_menu(bot, get_settings(), uid)
 
     @router.message(Command("admins"))
     async def on_admins(message: Message) -> None:

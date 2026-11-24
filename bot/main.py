@@ -71,6 +71,7 @@ async def main() -> None:
 
     from bot.db.base import init_db
     from bot.handlers import build_router
+    from bot.services.admin_menu import configure_admin_menus
     from bot.services.scheduler import GiveawayScheduler
     from bot.web.routes import register_web_routes
     from bot.web.webhook import register_webhook
@@ -101,6 +102,7 @@ async def main() -> None:
         scheduler.start()
         await scheduler.restore_from_db()
         await _configure_delivery(bot, settings)
+        await configure_admin_menus(bot, settings)
 
     async def on_shutdown(_app: web.Application) -> None:
         if settings.webhook_base_url:
