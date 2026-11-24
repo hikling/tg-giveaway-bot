@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
@@ -11,6 +13,7 @@ from bot.db.base import get_sessionmaker
 from bot.db.repo import list_running_giveaways
 
 log = logging.getLogger("bot.services.scheduler")
+_GROUP_MESSAGE_LIFETIME = timedelta(seconds=10)
 
 
 def _as_utc(value: datetime, giveaway_id: int) -> datetime:
@@ -29,7 +32,7 @@ def _as_utc(value: datetime, giveaway_id: int) -> datetime:
             giveaway_id,
             value.isoformat(),
         )
-        return value.replace(tzinfo=timezone.utc)
+        return value.replace(tzinfo=UTC)
     return value
 
 
@@ -92,11 +95,11 @@ class GiveawayScheduler:
         if draw_mode == "count":
             return
         run_at = _as_utc(end_at, giveaway_id)
-        if run_at <= datetime.now(timezone.utc):
+        if run_at <= datetime.now(UTC):
             # A giveaway restored from the DB whose deadline already passed
             # must fire immediately rather than being scheduled for the past
             # (APScheduler would refuse it outright).
-            run_at = datetime.now(timezone.utc)
+            run_at = datetime.now(UTC)
         job_id = f"giveaway-{giveaway_id}"
         self._scheduler.add_job(
             gw_service.finalize_and_publish,
@@ -107,6 +110,32 @@ class GiveawayScheduler:
             kwargs={"giveaway_id": giveaway_id, "bot": self._bot},
         )
         log.info("scheduled %s at %s", job_id, run_at.isoformat())
+
+    def schedule_group_message_deletion(self, chat_id: int, message_id: int) -> None:
+        self._scheduler.add_job(
+            self._delete_group_message,
+            "date",
+            run_date=datetime.now(UTC) + _GROUP_MESSAGE_LIFETIME,
+            id=f"group-message:{chat_id}:{message_id}",
+            replace_existing=True,
+            misfire_grace_time=None,
+            kwargs={"chat_id": chat_id, "message_id": message_id},
+        )
+
+    async def _delete_group_message(self, chat_id: int, message_id: int) -> None:
+        try:
+            try:
+                await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after)
+                await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramAPIError as exc:
+            log.debug(
+                "群消息删除失败，聊天 %s，消息 %s（%s）",
+                chat_id,
+                message_id,
+                type(exc).__name__,
+            )
 
     def cancel(self, giveaway_id: int) -> None:
         job_id = f"giveaway-{giveaway_id}"

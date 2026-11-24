@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.callbacks.factories import PrizeDraftCb
 from bot.filters.admin import IsAdmin
-from bot.handlers.common import lang_of
+from bot.handlers.common import answer_notice, lang_of
 from bot.i18n import t
 from bot.keyboards.admin import admin_giveaway_panel
 from bot.services import giveaway as gw_service
@@ -194,16 +194,18 @@ def build_admin_create_router() -> Router:
 
     @router.message(Command("cancel"), StateFilter(GiveawayDraft))
     @serialize_draft
-    async def on_cancel(message: Message, state: FSMContext) -> None:
+    async def on_cancel(message: Message, state: FSMContext, scheduler: GiveawayScheduler) -> None:
         await state.clear()
-        await message.answer(t("common.cancel", await lang_of(message.from_user.id)))
+        await answer_notice(
+            message, t("common.cancel", await lang_of(message.from_user.id)), scheduler
+        )
 
     @router.message(Command("newgiveaway"))
     @serialize_draft
-    async def on_new(message: Message, state: FSMContext) -> None:
+    async def on_new(message: Message, state: FSMContext, scheduler: GiveawayScheduler) -> None:
         lang = await lang_of(message.from_user.id)
         if message.chat.type != ChatType.PRIVATE:
-            await message.answer(t("prize.private_admin", lang))
+            await answer_notice(message, t("prize.private_admin", lang), scheduler)
             return
         await state.clear()
         await state.update_data(prize_draft_owner=message.from_user.id)

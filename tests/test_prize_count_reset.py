@@ -35,6 +35,7 @@ class Message:
 
     async def answer(self, text, **kwargs):
         self.responses.append((text, kwargs))
+        return SimpleNamespace(chat=self.chat, message_id=len(self.responses))
 
 
 def handler(name, *, stock=False, callback=False):
@@ -56,15 +57,20 @@ async def test_group_commands_do_not_open_a_prize_draft(sessionmaker):
     message = Message("/newgiveaway")
     message.chat = SimpleNamespace(id=-1004351, type="supergroup")
     state = context()
+    scheduler = Mock()
 
-    await handler("on_new")(message, state)
+    await handler("on_new")(message, state, scheduler)
     await handler("on_addcodes", stock=True)(
-        message, CommandObject(command="addcodes", args="1 一等奖"), state
+        message, CommandObject(command="addcodes", args="1 一等奖"), state, scheduler
     )
 
     assert await state.get_state() is None
     assert len(message.responses) == 2
     assert all("私聊" in text for text, _ in message.responses)
+    assert [call.args for call in scheduler.schedule_group_message_deletion.call_args_list] == [
+        (message.chat.id, 1),
+        (message.chat.id, 2),
+    ]
 
 
 async def setup_creation(*, mode="unique", tiers=None):
@@ -220,7 +226,7 @@ async def test_duplicate_accept_does_not_skip_next_tier(sessionmaker, admin):
 async def test_old_button_cannot_reset_new_draft(sessionmaker, admin):
     state = await setup_creation()
     old = button(await input_codes(state, "OLD"), "reset")
-    await handler("on_new")(Message("/newgiveaway"), state)
+    await handler("on_new")(Message("/newgiveaway"), state, Mock())
     before = await state.get_data()
     await click(state, old)
     assert await state.get_data() == before
@@ -299,7 +305,7 @@ async def stock_draft(gid):
     state = context()
     message = Message()
     await handler("on_addcodes", stock=True)(
-        message, CommandObject(command="addcodes", args=f"{gid} Steam card"), state
+        message, CommandObject(command="addcodes", args=f"{gid} Steam card"), state, Mock()
     )
     return state
 
@@ -348,7 +354,7 @@ async def test_stock_old_buttons_and_cancel_are_safe(sessionmaker, new_giveaway,
     await input_codes(state, "B", stock=True)
     await click(state, old, stock=True)
     assert not await rows(sessionmaker, gid)
-    await handler("on_cancel_codes", stock=True)(Message("/cancel"), state)
+    await handler("on_cancel_codes", stock=True)(Message("/cancel"), state, Mock())
     await click(state, old, stock=True)
     assert not await rows(sessionmaker, gid)
 

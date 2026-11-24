@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.enums import ChatType
@@ -32,13 +32,14 @@ def _handler(name, *, event="message"):
 
 
 def _message(uid, *, group=False):
+    chat = SimpleNamespace(
+        id=-1001002003004 if group else uid,
+        type=ChatType.SUPERGROUP if group else ChatType.PRIVATE,
+    )
     return SimpleNamespace(
         from_user=SimpleNamespace(id=uid),
-        chat=SimpleNamespace(
-            id=-1001002003004 if group else uid,
-            type=ChatType.SUPERGROUP if group else ChatType.PRIVATE,
-        ),
-        answer=AsyncMock(),
+        chat=chat,
+        answer=AsyncMock(return_value=SimpleNamespace(chat=chat, message_id=25)),
     )
 
 
@@ -58,19 +59,21 @@ async def test_prize_history_stays_in_the_winners_private_chat(bot, sessionmaker
     assert (await prize_service.claim(gid, WINNER, TIER)).status == CLAIM_OK
 
     history = _handler("on_myprizes")
+    scheduler = Mock()
     group = _message(WINNER, group=True)
-    await history(group, bot)
+    await history(group, bot, scheduler)
     group.answer.assert_awaited_once_with(t("prize.private_history"))
     assert bot.sent == []
 
     unrelated = _message(OTHER_USER)
-    await history(unrelated, bot)
+    await history(unrelated, bot, scheduler)
     unrelated.answer.assert_awaited_once_with(t("prize.myprizes_empty"))
     assert bot.sent == []
 
     private = _message(WINNER)
-    await history(private, bot)
+    await history(private, bot, scheduler)
     private.answer.assert_not_called()
+    scheduler.schedule_group_message_deletion.assert_called_once_with(group.chat.id, 25)
     assert len(bot.sent) == 1
     recipient, body, _ = bot.sent[0]
     assert recipient == WINNER
@@ -94,7 +97,7 @@ async def test_undrawn_results_cannot_release_prizes(bot, sessionmaker, new_give
 
     message = _message(WINNER)
     await _handler("on_claim_command")(
-        message, CommandObject(prefix="/", command="claim", args=str(gid)), bot
+        message, CommandObject(prefix="/", command="claim", args=str(gid)), bot, Mock()
     )
     message.answer.assert_awaited_once_with(t("prize.not_drawn"))
 
@@ -110,7 +113,7 @@ async def test_undrawn_results_cannot_release_prizes(bot, sessionmaker, new_give
         session.add(PrizeClaim(giveaway_id=gid, user_id=WINNER, tier_name=TIER, code_id=code.id))
         await session.commit()
     history = _message(WINNER)
-    await _handler("on_myprizes")(history, bot)
+    await _handler("on_myprizes")(history, bot, Mock())
     history.answer.assert_awaited_once_with(t("prize.myprizes_empty"))
     assert bot.sent == []
 
@@ -208,7 +211,7 @@ async def test_unsent_prize_can_be_recovered_from_private_history(bot, sessionma
     assert (await prize_service.stock(gid))[TIER].remaining == 1
 
     bot.fail_for.clear()
-    await _handler("on_myprizes")(_message(WINNER), bot)
+    await _handler("on_myprizes")(_message(WINNER), bot, Mock())
     assert len(bot.sent) == 1
     recipient, body, _ = bot.sent[0]
     assert recipient == WINNER
@@ -224,7 +227,7 @@ async def test_long_prize_history_is_delivered_as_a_private_file(bot, sessionmak
         assert (await prize_service.claim(gid, WINNER, TIER)).status == CLAIM_OK
 
     bot.send_document = AsyncMock()
-    await _handler("on_myprizes")(_message(WINNER), bot)
+    await _handler("on_myprizes")(_message(WINNER), bot, Mock())
     bot.send_document.assert_awaited_once()
     recipient, document = bot.send_document.await_args.args
     assert recipient == WINNER

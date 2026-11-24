@@ -17,9 +17,10 @@ from bot.db.models import GiveawayStatus
 from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_INELIGIBLE, CLAIM_OK
 from bot.db.repo import get_giveaway
 from bot.filters.admin import IsAdmin
-from bot.handlers.common import lang_of
+from bot.handlers.common import answer_notice, lang_of
 from bot.i18n import t
 from bot.services import prize as prize_service
+from bot.services.scheduler import GiveawayScheduler
 from bot.utils.esc import telegram_text_length
 from bot.utils.prize_input import (
     ACCEPT_TEXTS,
@@ -140,31 +141,33 @@ def build_prize_router() -> Router:
             await cq.answer()
 
     @router.message(Command("claim"))
-    async def on_claim_command(message: Message, command: CommandObject, bot: Bot) -> None:
+    async def on_claim_command(
+        message: Message, command: CommandObject, bot: Bot, scheduler: GiveawayScheduler
+    ) -> None:
         uid = message.from_user.id
         lang = await lang_of(uid)
         try:
             gid = int((command.args or "").strip().split()[0])
         except (ValueError, IndexError):
-            await message.answer(t("prize.claim_usage", lang))
+            await answer_notice(message, t("prize.claim_usage", lang), scheduler)
             return
 
         sm = get_sessionmaker()
         async with sm() as session:
             gw = await get_giveaway(session, gid)
         if gw is None:
-            await message.answer(t("prize.unknown", lang))
+            await answer_notice(message, t("prize.unknown", lang), scheduler)
             return
         if gw.status != GiveawayStatus.finished:
-            await message.answer(t("prize.not_drawn", lang))
+            await answer_notice(message, t("prize.not_drawn", lang), scheduler)
             return
         if gw.prize_mode == "none":
-            await message.answer(t("prize.none_mode", lang))
+            await answer_notice(message, t("prize.none_mode", lang), scheduler)
             return
 
         held = await prize_service.won_tiers(gid, uid, gw.prize_tiers or [])
         if not held:
-            await message.answer(t("prize.not_winner", lang))
+            await answer_notice(message, t("prize.not_winner", lang), scheduler)
             return
 
         statuses = set()
@@ -179,17 +182,17 @@ def build_prize_router() -> Router:
             )
             statuses.add(status)
         if _DELIVERY_FAILED in statuses:
-            await message.answer(t("prize.dm_failed", lang))
+            await answer_notice(message, t("prize.dm_failed", lang), scheduler)
         elif statuses.isdisjoint({CLAIM_OK, CLAIM_EMPTY}):
             key = "prize.already" if CLAIM_ALREADY in statuses else "prize.not_winner"
-            await message.answer(t(key, lang))
+            await answer_notice(message, t(key, lang), scheduler)
 
     @router.message(Command("myprizes"))
-    async def on_myprizes(message: Message, bot: Bot) -> None:
+    async def on_myprizes(message: Message, bot: Bot, scheduler: GiveawayScheduler) -> None:
         uid = message.from_user.id
         lang = await lang_of(uid)
         if message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
-            await message.answer(t("prize.private_history", lang))
+            await answer_notice(message, t("prize.private_history", lang), scheduler)
             return
         rows = await prize_service.claimed_by(uid)
         if not rows:
@@ -267,17 +270,19 @@ def build_prize_admin_router() -> Router:
     router.message.filter(IsAdmin())
 
     @router.message(Command("prizestatus"))
-    async def on_prizestatus(message: Message, command: CommandObject) -> None:
+    async def on_prizestatus(
+        message: Message, command: CommandObject, scheduler: GiveawayScheduler
+    ) -> None:
         lang = await lang_of(message.from_user.id)
         try:
             gid = int((command.args or "").strip().split()[0])
         except (ValueError, IndexError):
-            await message.answer(t("prize.status_usage", lang))
+            await answer_notice(message, t("prize.status_usage", lang), scheduler)
             return
 
         stock = await prize_service.stock(gid)
         if not stock:
-            await message.answer(t("prize.stock_empty", lang, id=gid))
+            await answer_notice(message, t("prize.stock_empty", lang, id=gid), scheduler)
             return
         lines = [t("prize.stock_header", lang, id=gid)]
         for tier in stock.values():
@@ -291,14 +296,19 @@ def build_prize_admin_router() -> Router:
                     remaining=tier.remaining,
                 )
             )
-        await message.answer("\n".join(lines))
+        await answer_notice(message, "\n".join(lines), scheduler)
 
     @router.message(Command("addcodes"))
     @serialize_draft
-    async def on_addcodes(message: Message, command: CommandObject, state: FSMContext) -> None:
+    async def on_addcodes(
+        message: Message,
+        command: CommandObject,
+        state: FSMContext,
+        scheduler: GiveawayScheduler,
+    ) -> None:
         lang = await lang_of(message.from_user.id)
         if message.chat.type != ChatType.PRIVATE:
-            await message.answer(t("prize.private_admin", lang))
+            await answer_notice(message, t("prize.private_admin", lang), scheduler)
             return
         parts = (command.args or "").split(None, 1)
         if len(parts) < 2:
@@ -346,9 +356,13 @@ def build_prize_admin_router() -> Router:
 
     @router.message(Command("cancel"), StateFilter(AddCodesDraft))
     @serialize_draft
-    async def on_cancel_codes(message: Message, state: FSMContext) -> None:
+    async def on_cancel_codes(
+        message: Message, state: FSMContext, scheduler: GiveawayScheduler
+    ) -> None:
         await state.clear()
-        await message.answer(t("common.cancel", await lang_of(message.from_user.id)))
+        await answer_notice(
+            message, t("common.cancel", await lang_of(message.from_user.id)), scheduler
+        )
 
     @router.message(StateFilter(AddCodesDraft.waiting_codes, AddCodesDraft.waiting_review))
     @serialize_draft

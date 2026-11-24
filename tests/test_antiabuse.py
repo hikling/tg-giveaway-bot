@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -137,6 +138,7 @@ async def test_the_announcement_reveals_the_seed(sessionmaker, bot) -> None:
 class FakeMessage:
     def __init__(self, user_id: int = ADMIN_ID) -> None:
         self.from_user = SimpleNamespace(id=user_id, username="admin")
+        self.chat = SimpleNamespace(id=user_id, type="private")
         self.text = ""
         self.answers: list[str] = []
 
@@ -159,7 +161,7 @@ async def test_gate_command_reports_the_current_policy(sessionmaker, new_giveawa
         if h.callback.__name__ == "on_gate"
     )
     message = FakeMessage()
-    await handler(message, SimpleNamespace(args=str(gid)))
+    await handler(message, SimpleNamespace(args=str(gid)), Mock())
 
     text = message.answers[-1]
     assert "古诗词" in text
