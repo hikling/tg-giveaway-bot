@@ -66,6 +66,7 @@ class PreparedDraft:
     condition: str
     fixed_condition: str
     destinations: list[Destination]
+    char_count: int
 
 
 async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedDraft:
@@ -125,7 +126,8 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
         count=0,
         commit="0" * 64,
     )
-    if telegram_text_length(post) > 4096:
+    post_length = telegram_text_length(post)
+    if post_length > 4096:
         raise AdminError("抽奖帖超过 Telegram 的长度限制，请缩短说明或精简奖项。")
     try:
         destinations = await resolve_publication_targets(request.app["bot"], channels, groups)
@@ -142,6 +144,7 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
         label,
         fixed_condition,
         destinations,
+        post_length,
     )
 
 
@@ -153,6 +156,10 @@ async def preview(request: web.Request) -> web.Response:
             "condition": prepared.condition,
             "fixed_condition": prepared.fixed_condition,
             "destinations": [target.name for target in prepared.destinations],
+            "channels": [display_requirement(value) for value in prepared.channels],
+            "groups": [display_requirement(value) for value in prepared.groups],
+            "char_count": prepared.char_count,
+            "char_limit": 4096,
             "tiers": [
                 {**tier, "inventory": len(codes)}
                 for tier, (_, codes) in zip(prepared.tiers, prepared.inventory, strict=True)

@@ -14,8 +14,16 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from sqlalchemy import select
 
-from bot.db.models import Giveaway, PrizeCode
-from bot.db.repo import add_admin, remove_admin
+from bot.db.models import Giveaway, GiveawayStatus, PrizeCode
+from bot.db.repo import (
+    add_admin,
+    add_participant,
+    ban_user,
+    ensure_user,
+    log_winners,
+    mark_winner_notified,
+    remove_admin,
+)
 from bot.settings import Settings
 from bot.web.routes import register_web_routes
 from tests.conftest import ADMIN_ID, BOT_ID
@@ -217,3 +225,82 @@ async def test_add_admin_grants_app_entry_in_their_private_chat(mini_app):
     assert menu_call["menu_button"].web_app.url == "https://giveaway.example/admin/"
     response = await client.get("/admin/api/access", headers=admin_headers(DB_ADMIN_ID))
     assert response.status == 200
+
+
+async def test_index_search_counts_detail_winners_and_access_management(
+    mini_app, sessionmaker, new_giveaway
+):
+    client, bot, _ = mini_app
+    headers = admin_headers()
+    gid_running = await new_giveaway(
+        title="Spring Steam Gift",
+        draw_seed="secret-seed-do-not-leak",
+        draw_commit="a" * 64,
+        required_channels=["@news|https://t.me/news|官方频道"],
+    )
+    gid_finished = await new_giveaway(
+        title="Autumn Key Drop",
+        draw_seed="revealed-seed",
+        draw_commit="b" * 64,
+        prize_mode="unique",
+    )
+    async with sessionmaker() as session:
+        gw_fin = await session.get(Giveaway, gid_finished)
+        gw_fin.status = GiveawayStatus.finished
+        await ensure_user(session, 1001, "lucky_winner")
+        await add_participant(session, giveaway_id=gid_finished, user_id=1001, username="lucky_winner")
+        rows = await log_winners(session, gid_finished, [(1001, "Steam card")])
+        await mark_winner_notified(session, rows[0].id, ok=False, error="Forbidden")
+        await ban_user(session, 9001, reason="spam bot", banned_by=ADMIN_ID)
+        await add_admin(session, DB_ADMIN_ID, added_by=ADMIN_ID)
+        await session.commit()
+
+    # Counts and search filtering
+    res = await client.get("/admin/api/giveaways?status=all", headers=headers)
+    assert res.status == 200
+    listing = await res.json()
+    assert listing["counts"] == {"running": 1, "finished": 1, "canceled": 0, "all": 2}
+
+    res = await client.get("/admin/api/giveaways?status=all&q=Autumn", headers=headers)
+    assert [item["id"] for item in (await res.json())["items"]] == [gid_finished]
+
+    # Running giveaway must not expose draw_seed
+    res = await client.get(f"/admin/api/giveaways/{gid_running}", headers=headers)
+    running_detail = await res.json()
+    assert running_detail["draw_commit"] == "a" * 64
+    assert running_detail["draw_seed"] is None
+    assert running_detail["requirements"]["channels"] == [
+        {"name": "官方频道", "url": "https://t.me/news"}
+    ]
+
+    # Finished giveaway exposes draw_seed, winners, and rerollable flag
+    res = await client.get(f"/admin/api/giveaways/{gid_finished}", headers=headers)
+    fin_detail = await res.json()
+    assert fin_detail["draw_seed"] == "revealed-seed"
+    assert fin_detail["tiers"][0]["rerollable"] is True
+    assert fin_detail["winners"][0]["user_id"] == "1001"
+    assert fin_detail["winners"][0]["username"] == "lucky_winner"
+    assert fin_detail["winners"][0]["notified_ok"] is False
+
+    # Access lists blacklist and lets admin remove dynamic DB admins (but not configured or self)
+    res = await client.get("/admin/api/access", headers=headers)
+    access = await res.json()
+    assert access["current_admin_id"] == str(ADMIN_ID)
+    assert access["blacklist"][0]["user_id"] == "9001"
+    assert access["blacklist"][0]["reason"] == "spam bot"
+
+    res = await client.post(
+        "/admin/api/access",
+        headers=headers,
+        json={"action": "remove-admin", "user_id": str(ADMIN_ID)},
+    )
+    assert res.status == 400
+
+    res = await client.post(
+        "/admin/api/access",
+        headers=headers,
+        json={"action": "remove-admin", "user_id": str(DB_ADMIN_ID)},
+    )
+    assert res.status == 200
+    assert (await client.get("/admin/api/access", headers=admin_headers(DB_ADMIN_ID))).status == 403
+    assert bot.set_chat_menu_button.await_count >= 1
