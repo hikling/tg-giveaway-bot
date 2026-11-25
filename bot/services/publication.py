@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import weakref
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,10 @@ log = logging.getLogger(__name__)
 _publish_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # 记录每个已发抽奖帖最近一次展示的报名人数，避免人数未变化时重复调用编辑接口。
 _last_displayed_counts: dict[tuple[str, int, int, int], int] = {}
+_SYNC_MIN_INTERVAL = 2.0
+_last_sync_at: dict[int, float] = {}
+_pending_sync_tasks: dict[int, asyncio.Task[None]] = {}
+_sync_dirty: set[int] = set()
 
 
 @dataclass(frozen=True)
@@ -198,8 +203,56 @@ async def _edit_post_count(
     return False
 
 
+async def refresh_giveaway_post_count(
+    bot: Bot, gid: int, *, allow_finished: bool = False
+) -> int:
+    """刷新单场抽奖全部已发帖子的报名人数。"""
+    if not hasattr(bot, "edit_message_text"):
+        return 0
+    async with get_sessionmaker()() as session:
+        gw = await session.get(Giveaway, gid)
+        if gw is None or gw.publishing:
+            return 0
+        if allow_finished:
+            if gw.status != GiveawayStatus.finished:
+                return 0
+        elif gw.status != GiveawayStatus.running or _expired(gw):
+            return 0
+        count = await count_participants(session, gid, exclude_blacklisted=True)
+        text = render_running_post(gw, count)
+        legacy_chat, legacy_msg = gw.chat_id, gw.message_id
+        commit_key = gw.draw_commit or ""
+
+    locations = await post_locations(gid, legacy_chat, legacy_msg)
+    targets = [
+        (chat_id, message_id)
+        for chat_id, message_id in locations
+        if _last_displayed_counts.get((commit_key, gid, chat_id, message_id)) != count
+    ]
+    if not targets:
+        return 0
+
+    markup = participate_keyboard(gid, "zh")
+    updated = 0
+    for chat_id, message_id in targets:
+        if await _edit_post_count(
+            bot,
+            gid=gid,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            markup=markup,
+            cache_key=(commit_key, gid, chat_id, message_id),
+            count=count,
+        ):
+            updated += 1
+    return updated
+
+
 async def refresh_running_post_counts(bot: Bot) -> int:
     """定时刷新进行中抽奖帖的已报名人数，避免帖子长期停留在 0 人。"""
+    if not hasattr(bot, "edit_message_text"):
+        return 0
     async with get_sessionmaker()() as session:
         running_ids = list(
             await session.scalars(
@@ -212,38 +265,78 @@ async def refresh_running_post_counts(bot: Bot) -> int:
     for key in list(_last_displayed_counts):
         if key[1] not in active_ids:
             _last_displayed_counts.pop(key, None)
+    for gid in list(_last_sync_at):
+        if gid not in active_ids:
+            _last_sync_at.pop(gid, None)
 
     updated = 0
     for gid in running_ids:
-        async with get_sessionmaker()() as session:
-            gw = await session.get(Giveaway, gid)
-            if gw is None or gw.status != GiveawayStatus.running or gw.publishing or _expired(gw):
-                continue
-            count = await count_participants(session, gid, exclude_blacklisted=True)
-            text = render_running_post(gw, count)
-            legacy_chat, legacy_msg = gw.chat_id, gw.message_id
-            commit_key = gw.draw_commit or ""
-
-        locations = await post_locations(gid, legacy_chat, legacy_msg)
-        targets = [
-            (chat_id, message_id)
-            for chat_id, message_id in locations
-            if _last_displayed_counts.get((commit_key, gid, chat_id, message_id)) != count
-        ]
-        if not targets:
-            continue
-
-        markup = participate_keyboard(gid, "zh")
-        for chat_id, message_id in targets:
-            if await _edit_post_count(
-                bot,
-                gid=gid,
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                markup=markup,
-                cache_key=(commit_key, gid, chat_id, message_id),
-                count=count,
-            ):
-                updated += 1
+        updated += await refresh_giveaway_post_count(bot, gid)
     return updated
+
+
+async def _sync_worker(bot: Bot, gid: int) -> None:
+    try:
+        while gid in _sync_dirty:
+            _sync_dirty.discard(gid)
+            elapsed = time.monotonic() - _last_sync_at.get(gid, 0.0)
+            if elapsed < _SYNC_MIN_INTERVAL:
+                await asyncio.sleep(_SYNC_MIN_INTERVAL - elapsed)
+                _sync_dirty.discard(gid)
+            _last_sync_at[gid] = time.monotonic()
+            await refresh_giveaway_post_count(bot, gid)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("实时刷新抽奖%s人数失败", gid)
+    finally:
+        current = asyncio.current_task()
+        if _pending_sync_tasks.get(gid) is current:
+            _pending_sync_tasks.pop(gid, None)
+
+
+def schedule_post_count_sync(bot: Bot, gid: int) -> None:
+    """报名人数变化后节流触发实时刷新，兼顾即时更新与防限流。"""
+    if not hasattr(bot, "edit_message_text"):
+        return
+    _sync_dirty.add(gid)
+    existing = _pending_sync_tasks.get(gid)
+    if existing is not None and not existing.done():
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _pending_sync_tasks[gid] = asyncio.create_task(_sync_worker(bot, gid))
+
+
+async def schedule_running_post_counts_sync(bot: Bot) -> None:
+    if not hasattr(bot, "edit_message_text"):
+        return
+    async with get_sessionmaker()() as session:
+        running_ids = list(
+            await session.scalars(
+                select(Giveaway.id).where(
+                    Giveaway.status == GiveawayStatus.running, Giveaway.publishing.is_(False)
+                )
+            )
+        )
+    for gid in running_ids:
+        schedule_post_count_sync(bot, gid)
+
+
+def cancel_post_count_sync(gid: int) -> None:
+    _sync_dirty.discard(gid)
+    task = _pending_sync_tasks.pop(gid, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def flush_post_count_sync(gid: int | None = None) -> None:
+    tasks = (
+        [_pending_sync_tasks[gid]]
+        if gid is not None and gid in _pending_sync_tasks
+        else list(_pending_sync_tasks.values())
+    )
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)

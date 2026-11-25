@@ -166,7 +166,14 @@ async def publish_winners(
         )
     messages = list(_announcement_batches(lines))
 
-    from bot.services.publication import post_locations
+    from bot.services.publication import (
+        cancel_post_count_sync,
+        post_locations,
+        refresh_giveaway_post_count,
+    )
+
+    cancel_post_count_sync(giveaway.id)
+    await refresh_giveaway_post_count(bot, giveaway.id, allow_finished=True)
 
     for chat_id, message_id in await post_locations(
         giveaway.id, giveaway.chat_id, giveaway.message_id

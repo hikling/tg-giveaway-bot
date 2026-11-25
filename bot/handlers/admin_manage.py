@@ -201,7 +201,7 @@ def build_admin_manage_router() -> Router:
 
     @router.message(Command("ban"))
     async def on_ban(
-        message: Message, command: CommandObject, scheduler: GiveawayScheduler
+        message: Message, command: CommandObject, bot: Bot, scheduler: GiveawayScheduler
     ) -> None:
         lang = await lang_of(message.from_user.id)
         if not command.args:
@@ -220,6 +220,10 @@ def build_admin_manage_router() -> Router:
             # blacklisted mid-giveaway kept their seat and could still win.
             removed = await delete_participations(session, uid)
             await session.commit()
+        if removed:
+            from bot.services.publication import schedule_running_post_counts_sync
+
+            await schedule_running_post_counts_sync(bot)
         key = "admin.ban_ok" if removed else "admin.ban_ok_none"
         await answer_notice(message, t(key, lang, user_id=uid, n=removed), scheduler)
 

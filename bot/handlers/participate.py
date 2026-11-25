@@ -23,6 +23,7 @@ from bot.services.channels import display_requirement, linked_requirements, miss
 from bot.services.giveaway import draw_if_full, publish_draw
 from bot.services.notifier import winner_delivery_lock
 from bot.services.poetry import Challenge, answer, get_challenge, record_delivery
+from bot.services.publication import cancel_post_count_sync, schedule_post_count_sync
 from bot.settings import get_settings
 from bot.utils.antiabuse import account_age_gate
 
@@ -196,11 +197,14 @@ def build_participate_router() -> Router:
                 draw = await draw_if_full(session, gid) if result == "ok" else None
                 await session.commit()
             if draw is not None:
+                cancel_post_count_sync(gid)
                 try:
                     await _report_answer(cq, result, challenge)
                 finally:
                     await publish_draw(cq.bot, draw)
                 return
+            if result == "ok":
+                schedule_post_count_sync(cq.bot, gid)
         await _report_answer(cq, result, challenge)
 
     return router

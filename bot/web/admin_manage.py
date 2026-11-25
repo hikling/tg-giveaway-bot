@@ -39,7 +39,7 @@ from bot.services import prize as prize_service
 from bot.services.admin_menu import set_admin_menu
 from bot.services.channels import display_requirement, format_requirement_line, requirement_url
 from bot.services.notifier import retry_pending
-from bot.services.publication import publish_all
+from bot.services.publication import publish_all, schedule_running_post_counts_sync
 from bot.settings import Settings
 from bot.utils.prize_input import parse_input
 from bot.utils.timeparse import format_draw_condition
@@ -391,6 +391,7 @@ async def access_action(request: web.Request) -> web.Response:
             raise AdminError("部署配置中的管理员无法在小程序移除。")
         if uid == actor:
             raise AdminError("不能移除当前正在使用的管理员账号。")
+    removed = 0
     async with get_sessionmaker()() as session:
         if payload.action == "ban":
             await ban_user(session, uid, reason=payload.reason.strip() or None, banned_by=actor)
@@ -408,7 +409,9 @@ async def access_action(request: web.Request) -> web.Response:
             await add_admin(session, uid, added_by=actor)
             message = f"已添加管理员 {uid}。"
         await session.commit()
-    if payload.action == "add-admin":
+    if payload.action == "ban" and removed:
+        await schedule_running_post_counts_sync(request.app["bot"])
+    elif payload.action == "add-admin":
         await set_admin_menu(request.app["bot"], settings, uid)
     elif payload.action == "remove-admin":
         try:

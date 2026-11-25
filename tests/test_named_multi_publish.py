@@ -414,3 +414,63 @@ async def test_refresh_running_post_counts_updates_posts_and_scheduler_runs_ever
         assert job.trigger.interval == timedelta(minutes=5)
     finally:
         scheduler.shutdown()
+
+
+async def test_realtime_count_sync_on_join_ban_startup_and_burst_throttle(
+    sessionmaker, monkeypatch
+):
+    from bot.services import publication
+
+    class EditableBot(PostingBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.edited: list[tuple[int, int, str, dict]] = []
+
+        async def edit_message_text(self, text: str, *, chat_id: int, message_id: int, **kwargs):
+            self.edited.append((chat_id, message_id, text, kwargs))
+
+    monkeypatch.setattr(publication, "_SYNC_MIN_INTERVAL", 0.05)
+    bot = EditableBot()
+    gw = await new_multi_game()
+    await publish_all(bot, gw.id)
+    bot.set_member("@news", 1001, "member")
+    bot.set_member("-100222", 1001, "member")
+    bot.set_member("@news", 1002, "member")
+    bot.set_member("-100222", 1002, "member")
+    bot.set_member("@news", 1003, "member")
+    bot.set_member("-100222", 1003, "member")
+
+    # 1. Answering poetry triggers immediate real-time sync (0 -> 1)
+    q1, _ = await begin(bot, gw.id, uid=1001)
+    await choose(bot, q1, uid=1001, correct=True)
+    await publication.flush_post_count_sync(gw.id)
+    assert len(bot.edited) == 2
+    assert all("已报名：1 人" in text for _, _, text, _ in bot.edited)
+
+    # 2. Rapid burst joins within throttle window coalesce cleanly (1 -> 3)
+    q2, _ = await begin(bot, gw.id, uid=1002)
+    q3, _ = await begin(bot, gw.id, uid=1003)
+    await choose(bot, q2, uid=1002, correct=True)
+    await choose(bot, q3, uid=1003, correct=True)
+    await publication.flush_post_count_sync(gw.id)
+    assert len(bot.edited) == 4
+    assert all("已报名：3 人" in text for _, _, text, _ in bot.edited[-2:])
+
+    # 3. Banning a participant decrements displayed count in real time (3 -> 2)
+    from bot.db.repo import ban_user, delete_participations
+
+    async with sessionmaker() as session:
+        await ban_user(session, 1003, reason="abuse", banned_by=1)
+        await delete_participations(session, 1003)
+        await session.commit()
+    await publication.schedule_running_post_counts_sync(bot)
+    await publication.flush_post_count_sync(gw.id)
+    assert len(bot.edited) == 6
+    assert all("已报名：2 人" in text for _, _, text, _ in bot.edited[-2:])
+
+    # 4. Restart recovery refreshes existing running giveaways immediately without waiting 5m
+    publication._last_displayed_counts.clear()
+    scheduler = GiveawayScheduler(bot)
+    await scheduler.restore_from_db()
+    assert len(bot.edited) == 8
+    assert all("已报名：2 人" in text for _, _, text, _ in bot.edited[-2:])

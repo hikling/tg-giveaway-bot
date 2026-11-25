@@ -111,6 +111,8 @@ async def attach_message(giveaway_id: int, chat_id: int, message_id: int) -> Non
 
 
 async def cancel(giveaway_id: int) -> bool:
+    from bot.services.publication import cancel_post_count_sync
+
     sm = get_sessionmaker()
     async with sm() as session:
         gw = await claim_giveaway(
@@ -122,7 +124,8 @@ async def cancel(giveaway_id: int) -> bool:
         if gw is None:
             return False
         await session.commit()
-        return True
+    cancel_post_count_sync(giveaway_id)
+    return True
 
 
 def _tier_count(prize_tiers: list[dict] | None, tier_name: str) -> int:

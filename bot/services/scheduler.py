@@ -87,6 +87,7 @@ class GiveawayScheduler:
         log.info("restoring %d running giveaway(s)", len(running))
         from bot.services.giveaway import restore_count_draw
         from bot.services.poetry import expire_due_questions
+        from bot.services.publication import refresh_running_post_counts
 
         for gw in running:
             if gw.publishing:
@@ -99,6 +100,7 @@ class GiveawayScheduler:
             if gw.draw_mode in {"count", "either"}:
                 await restore_count_draw(gw.id, self._bot)
         await expire_due_questions(self._bot)
+        await refresh_running_post_counts(self._bot)
 
     def schedule(self, giveaway_id: int, end_at: datetime, draw_mode: str = "time") -> None:
         from bot.services import giveaway as gw_service
