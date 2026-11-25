@@ -852,6 +852,9 @@ textarea { resize: vertical; }
     background: var(--soft);
     border: 1px solid var(--border);
 }
+.segmented-radios.three {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
 .segmented-item {
     display: flex;
     align-items: center;
@@ -871,25 +874,31 @@ textarea { resize: vertical; }
     box-shadow: var(--shadow-sm);
 }
 
-/* Quick Presets & Parsed Chips */
-.preset-row, .parsed-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chip-btn {
+/* Parsed Chips & Saved Location Picker */
+.parsed-chips, .pick-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.saved-picks { display: grid; gap: 6px; }
+.pick-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     padding: 5px 11px;
-    min-height: 32px;
+    min-height: 34px;
     border: 1px solid var(--border-strong);
     border-radius: 999px;
     background: var(--canvas);
     color: var(--ink);
-    font-size: .8rem;
+    font-size: .82rem;
     font-weight: 600;
     transition: border-color 130ms ease, background-color 130ms ease, color 130ms ease;
 }
-.chip-btn:hover { border-color: var(--brand); color: var(--brand-ink); }
-.chip-btn.is-selected {
+.pick-pill:hover { border-color: var(--brand); }
+.pick-pill[aria-pressed="true"] {
     border-color: var(--brand);
     background: var(--brand-soft);
     color: var(--brand-ink);
 }
+.pick-pill svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.pick-pill[aria-pressed="false"] svg { opacity: .28; }
 .parsed-chip {
     display: inline-flex;
     align-items: center;

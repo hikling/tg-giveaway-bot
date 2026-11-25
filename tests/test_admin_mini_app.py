@@ -304,3 +304,96 @@ async def test_index_search_counts_detail_winners_and_access_management(
     assert res.status == 200
     assert (await client.get("/admin/api/access", headers=admin_headers(DB_ADMIN_ID))).status == 403
     assert bot.set_chat_menu_button.await_count >= 1
+
+
+async def test_locations_endpoint_single_or_multi_and_canceled_stock_guard(
+    mini_app, new_giveaway, monkeypatch
+):
+    client, bot, _ = mini_app
+    headers = admin_headers()
+    await new_giveaway(
+        required_channels=["@news|https://t.me/news|官方频道"],
+        required_groups=["-100222|https://t.me/+invite|交流群"],
+    )
+
+    res = await client.get("/admin/api/locations", headers=headers)
+    assert res.status == 200
+    locs = await res.json()
+    assert locs["channels"] == [
+        {"name": "官方频道", "line": "官方频道 | https://t.me/news", "private": False}
+    ]
+    assert locs["groups"] == [
+        {"name": "交流群", "line": "交流群 | https://t.me/+invite | -100222", "private": True}
+    ]
+
+    # Single channel only
+    res = await client.post(
+        "/admin/api/create/preview",
+        headers=headers,
+        json={
+            "title": "单频道抽奖",
+            "channels": "单频道 | https://t.me/news",
+            "groups": "",
+            "condition": "1h",
+            "prize_mode": "none",
+            "tiers": [{"name": "一等奖", "count": 1}],
+        },
+    )
+    assert res.status == 200, await res.text()
+    assert (await res.json())["destinations"] == ["单频道"]
+
+    # Single group only
+    res = await client.post(
+        "/admin/api/create/preview",
+        headers=headers,
+        json={
+            "title": "单群组抽奖",
+            "channels": "",
+            "groups": "单群 | https://t.me/+invite | -100222",
+            "condition": "1h",
+            "prize_mode": "none",
+            "tiers": [{"name": "一等奖", "count": 1}],
+        },
+    )
+    assert res.status == 200, await res.text()
+    assert (await res.json())["destinations"] == ["单群"]
+
+    # Multiple channels and multiple groups
+    orig_get_chat = bot.get_chat
+
+    async def multi_get_chat(ref):
+        if str(ref) == "@ch2":
+            return SimpleNamespace(id=-100444, type="channel", title="频道B")
+        return await orig_get_chat(ref)
+
+    monkeypatch.setattr(bot, "get_chat", multi_get_chat)
+    bot.set_member("@ch2", BOT_ID, "administrator")
+    bot.set_member("-100333", BOT_ID, "administrator")
+    res = await client.post(
+        "/admin/api/create/preview",
+        headers=headers,
+        json={
+            "title": "多频道多群组抽奖",
+            "channels": "频道A | https://t.me/news\n频道B | https://t.me/ch2",
+            "groups": "群A | https://t.me/+inv1 | -100222\n群B | https://t.me/+inv2 | -100333",
+            "condition": "1h",
+            "prize_mode": "none",
+            "tiers": [{"name": "一等奖", "count": 1}],
+        },
+    )
+    assert res.status == 200, await res.text()
+    assert set((await res.json())["destinations"]) == {"频道A", "频道B", "群A", "群B"}
+
+    # Canceled giveaway cannot be restocked
+    gid = await new_giveaway(prize_mode="unique")
+    assert (
+        await client.post(
+            f"/admin/api/giveaways/{gid}/actions", headers=headers, json={"action": "cancel"}
+        )
+    ).status == 200
+    res = await client.post(
+        f"/admin/api/giveaways/{gid}/actions",
+        headers=headers,
+        json={"action": "add-stock", "tier": "Steam card", "codes": "X"},
+    )
+    assert res.status == 409

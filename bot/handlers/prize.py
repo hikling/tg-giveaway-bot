@@ -15,7 +15,7 @@ from bot.callbacks.factories import ClaimCb, PrizeDraftCb
 from bot.db.base import get_sessionmaker
 from bot.db.models import GiveawayStatus
 from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_INELIGIBLE, CLAIM_OK
-from bot.db.repo import get_giveaway
+from bot.db.repo import get_giveaway, is_blacklisted
 from bot.filters.admin import IsAdmin
 from bot.handlers.common import answer_notice, lang_of
 from bot.i18n import t
@@ -111,11 +111,15 @@ def build_prize_router() -> Router:
         sm = get_sessionmaker()
         async with sm() as session:
             gw = await get_giveaway(session, gid)
+            banned = await is_blacklisted(session, uid)
         if gw is None:
             await cq.answer(t("prize.unknown", lang), show_alert=True)
             return
-        if gw.status != GiveawayStatus.finished:
+        if gw.status != GiveawayStatus.finished or gw.publishing:
             await cq.answer(t("prize.not_drawn", lang), show_alert=True)
+            return
+        if banned:
+            await cq.answer(t("join.banned", lang), show_alert=True)
             return
         if gw.prize_mode == "none":
             await cq.answer(t("prize.none_mode", lang), show_alert=True)
@@ -155,11 +159,15 @@ def build_prize_router() -> Router:
         sm = get_sessionmaker()
         async with sm() as session:
             gw = await get_giveaway(session, gid)
+            banned = await is_blacklisted(session, uid)
         if gw is None:
             await answer_notice(message, t("prize.unknown", lang), scheduler)
             return
-        if gw.status != GiveawayStatus.finished:
+        if gw.status != GiveawayStatus.finished or gw.publishing:
             await answer_notice(message, t("prize.not_drawn", lang), scheduler)
+            return
+        if banned:
+            await answer_notice(message, t("join.banned", lang), scheduler)
             return
         if gw.prize_mode == "none":
             await answer_notice(message, t("prize.none_mode", lang), scheduler)

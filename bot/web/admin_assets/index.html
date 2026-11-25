@@ -110,12 +110,50 @@
             <section id="step-locations" class="panel form-section">
                 <div class="section-title-row">
                     <h3><span class="step-badge">2</span>发布位置与报名条件</h3>
-                    <span class="hint">至少填写一处</span>
+                    <span class="hint">单选或多选皆可</span>
                 </div>
-                <p class="hint" id="location-guide">每行一处。机器人将自动发布抽奖帖到全部所填位置，参与者须全部加入才能报名。</p>
+                <p class="hint" id="location-guide">支持只选 1 个频道或 1 个群组，也支持同时添加多个频道和群组（每行一处）；参与者须全部加入才能报名。</p>
+
+                <div class="field-group">
+                    <span class="field-label">发布范围</span>
+                    <div class="segmented-radios three">
+                        <label class="segmented-item">
+                            <input type="radio" name="location_scope" value="both" checked>
+                            <span>频道 + 群组</span>
+                        </label>
+                        <label class="segmented-item">
+                            <input type="radio" name="location_scope" value="channels">
+                            <span>仅频道</span>
+                        </label>
+                        <label class="segmented-item">
+                            <input type="radio" name="location_scope" value="groups">
+                            <span>仅群组</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="channels-field" class="field-group">
+                    <div class="field-header">
+                        <label for="create-channels">必加频道</label>
+                        <span class="hint">可填 1 个或多个（每行一处）</span>
+                    </div>
+                    <div id="channels-saved" class="saved-picks" hidden></div>
+                    <textarea id="create-channels" name="channels" rows="2" placeholder="官方频道 | https://t.me/your_channel" aria-describedby="location-guide private-guide"></textarea>
+                    <div class="parsed-chips" id="channels-preview"></div>
+                </div>
+
+                <div id="groups-field" class="field-group">
+                    <div class="field-header">
+                        <label for="create-groups">必加群组</label>
+                        <span class="hint">可填 1 个或多个（每行一处）</span>
+                    </div>
+                    <div id="groups-saved" class="saved-picks" hidden></div>
+                    <textarea id="create-groups" name="groups" rows="2" placeholder="交流群 | https://t.me/your_group&#10;私有群 | https://t.me/+invite | -1001234567890" aria-describedby="location-guide private-guide"></textarea>
+                    <div class="parsed-chips" id="groups-preview"></div>
+                </div>
 
                 <details class="quick-builder" id="location-builder">
-                    <summary class="button secondary compact">+ 快捷拼装一行格式</summary>
+                    <summary class="button secondary compact">+ 手动添加一行位置</summary>
                     <div class="builder-body">
                         <div class="builder-grid">
                             <label>类型
@@ -145,18 +183,6 @@
                         </div>
                     </div>
                 </details>
-
-                <div class="field-group">
-                    <label for="create-channels">必加频道</label>
-                    <textarea id="create-channels" name="channels" rows="2" placeholder="官方频道 | https://t.me/your_channel" aria-describedby="location-guide private-guide"></textarea>
-                    <div class="parsed-chips" id="channels-preview"></div>
-                </div>
-
-                <div class="field-group">
-                    <label for="create-groups">必加群组</label>
-                    <textarea id="create-groups" name="groups" rows="2" placeholder="交流群 | https://t.me/your_group&#10;私有群 | https://t.me/+invite | -1001234567890" aria-describedby="location-guide private-guide"></textarea>
-                    <div class="parsed-chips" id="groups-preview"></div>
-                </div>
 
                 <p id="private-guide" class="hint callout-hint">私有链接请使用 <code>名称 | https://t.me/+邀请码 | -100编号</code>，确保机器人已加入并拥有管理员权限。</p>
             </section>
@@ -209,16 +235,6 @@
                 </div>
 
                 <div id="duration-field" class="stack-sm">
-                    <div class="preset-row" id="duration-presets" aria-label="快捷时长">
-                        <button type="button" class="chip-btn" data-duration="15" data-unit="m">15 分钟</button>
-                        <button type="button" class="chip-btn" data-duration="30" data-unit="m">30 分钟</button>
-                        <button type="button" class="chip-btn" data-duration="1" data-unit="h">1 小时</button>
-                        <button type="button" class="chip-btn" data-duration="6" data-unit="h">6 小时</button>
-                        <button type="button" class="chip-btn" data-duration="12" data-unit="h">12 小时</button>
-                        <button type="button" class="chip-btn" data-duration="24" data-unit="h">24 小时</button>
-                        <button type="button" class="chip-btn" data-duration="3" data-unit="d">3 天</button>
-                        <button type="button" class="chip-btn" data-duration="7" data-unit="d">7 天</button>
-                    </div>
                     <div class="tier-fields">
                         <label>持续时长
                             <input type="number" name="duration" inputmode="numeric" min="1" max="1000000" step="1" value="1">
@@ -238,26 +254,12 @@
                 </div>
 
                 <div id="deadline-field" class="stack-sm" hidden>
-                    <div class="preset-row" id="deadline-presets" aria-label="快捷时间">
-                        <button type="button" class="chip-btn" data-hours="1">+1 小时</button>
-                        <button type="button" class="chip-btn" data-hours="6">+6 小时</button>
-                        <button type="button" class="chip-btn" data-hours="24">+24 小时</button>
-                        <button type="button" class="chip-btn" data-evening="0">今晚 20:00</button>
-                        <button type="button" class="chip-btn" data-evening="1">明晚 20:00</button>
-                    </div>
                     <label>开奖时间
                         <input type="datetime-local" name="deadline" required>
                     </label>
                 </div>
 
                 <div id="target-field" class="stack-sm" hidden>
-                    <div class="preset-row" id="target-presets" aria-label="快捷人数">
-                        <button type="button" class="chip-btn" data-target="50">50 人</button>
-                        <button type="button" class="chip-btn" data-target="100">100 人</button>
-                        <button type="button" class="chip-btn" data-target="200">200 人</button>
-                        <button type="button" class="chip-btn" data-target="500">500 人</button>
-                        <button type="button" class="chip-btn" data-target="1000">1000 人</button>
-                    </div>
                     <label>有效报名目标人数
                         <input type="number" name="target" inputmode="numeric" min="1" max="1000000000" step="1" placeholder="例如：100">
                     </label>

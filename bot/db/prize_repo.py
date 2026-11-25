@@ -4,12 +4,12 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Giveaway, GiveawayStatus, PrizeClaim, PrizeCode, WinnerLog
-from bot.db.repo import claim_giveaway
+from bot.db.repo import claim_giveaway, is_blacklisted
 from bot.utils.prize_input import normalize_codes
 
 log = logging.getLogger("bot.db.prize_repo")
@@ -93,6 +93,24 @@ async def add_codes(
         codes = await new_unique_codes(session, giveaway_id, codes)
     else:
         codes = normalize_codes(codes)
+        if codes:
+            # 共享文本更新时移除尚未领取的旧行，并将已领取旧行封顶，确保后续中奖者拿到最新文本。
+            await session.execute(
+                delete(PrizeCode).where(
+                    PrizeCode.giveaway_id == giveaway_id,
+                    PrizeCode.tier_name == tier,
+                    PrizeCode.claimed_count == 0,
+                )
+            )
+            await session.execute(
+                update(PrizeCode)
+                .where(
+                    PrizeCode.giveaway_id == giveaway_id,
+                    PrizeCode.tier_name == tier,
+                    PrizeCode.claimed_count > 0,
+                )
+                .values(max_claims=PrizeCode.claimed_count)
+            )
     for code in codes:
         session.add(
             PrizeCode(
@@ -185,6 +203,7 @@ async def claim_code(
         gw is None
         or gw.publishing
         or gw.prize_mode not in {"unique", "shared"}
+        or await is_blacklisted(session, user_id)
         or tier not in await current_winner_tiers(session, giveaway_id, user_id)
     ):
         return ClaimOutcome(CLAIM_INELIGIBLE)

@@ -78,6 +78,18 @@ def display_requirement(raw: str) -> str:
     return parts[2] if len(parts) == 3 else parts[0]
 
 
+def format_requirement_line(raw: str) -> str:
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) == 3:
+        ref, link, name = parts
+        if ref.startswith("-"):
+            return f"{name} | {link} | {ref}"
+        return f"{name} | {link}"
+    if len(parts) == 2:
+        return f"{parts[0]} | {parts[1]}"
+    return parts[0]
+
+
 def requirement_url(raw: str) -> str | None:
     parts = raw.split("|")
     if len(parts) > 1 and _valid_url(parts[1]):

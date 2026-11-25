@@ -54,6 +54,7 @@ def register_web_routes(app: web.Application) -> None:
         )
         app.router.add_post("/admin/api/create/preview", admin_endpoint(admin_create.preview))
         app.router.add_post("/admin/api/create", admin_endpoint(admin_create.create))
+        app.router.add_get("/admin/api/locations", admin_endpoint(admin_manage.location_options))
         app.router.add_get("/admin/api/access", admin_endpoint(admin_manage.access_details))
         app.router.add_post("/admin/api/access", admin_endpoint(admin_manage.access_action))
     log.info("web routes registered: /healthz")

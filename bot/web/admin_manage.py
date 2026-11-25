@@ -37,7 +37,7 @@ from bot.db.repo import (
 from bot.services import giveaway as giveaway_service
 from bot.services import prize as prize_service
 from bot.services.admin_menu import set_admin_menu
-from bot.services.channels import display_requirement, requirement_url
+from bot.services.channels import display_requirement, format_requirement_line, requirement_url
 from bot.services.notifier import retry_pending
 from bot.services.publication import publish_all
 from bot.settings import Settings
@@ -114,7 +114,7 @@ async def giveaway_index(request: web.Request) -> web.Response:
         stmt = stmt.where(Giveaway.status == GiveawayStatus(status))
     if "before" in request.query:
         stmt = stmt.where(Giveaway.id < _id(request.query["before"], "分页编号无效。"))
-    query = request.query.get("q", "").strip()
+    query = request.query.get("q", "").strip()[:256]
     if query:
         id_text = query.removeprefix("#").strip()
         if re.fullmatch(r"[1-9][0-9]{0,18}", id_text) and int(id_text) <= 2**63 - 1:
@@ -243,6 +243,8 @@ async def giveaway_detail(request: web.Request) -> web.Response:
 
 
 async def _stock_action(gw: Giveaway, payload: GiveawayAction, tier: str) -> dict:
+    if gw.status == GiveawayStatus.canceled:
+        raise AdminError("这场抽奖已取消，无法补充奖池。", status=409)
     if gw.prize_mode not in {"shared", "unique"}:
         raise AdminError("这场抽奖由主办方发奖，无需补充奖池。")
     codes = parse_input(payload.codes, gw.prize_mode)
@@ -318,6 +320,37 @@ async def giveaway_action(request: web.Request) -> web.Response:
             message += f"计划 {shortfall.requested} 名，符合条件的人数不足。"
         return web.json_response({"message": message, "count": count})
     return web.json_response(await _stock_action(gw, payload, tier))
+
+
+async def location_options(_request: web.Request) -> web.Response:
+    channels: dict[str, dict] = {}
+    groups: dict[str, dict] = {}
+    async with get_sessionmaker()() as session:
+        rows = (
+            await session.execute(
+                select(Giveaway.required_channels, Giveaway.required_groups)
+                .order_by(Giveaway.id.desc())
+                .limit(80)
+            )
+        ).all()
+    for ch_list, gp_list in rows:
+        for raw in ch_list or []:
+            if raw not in channels and len(channels) < 24:
+                channels[raw] = {
+                    "name": display_requirement(raw),
+                    "line": format_requirement_line(raw),
+                    "private": raw.startswith("-"),
+                }
+        for raw in gp_list or []:
+            if raw not in groups and len(groups) < 24:
+                groups[raw] = {
+                    "name": display_requirement(raw),
+                    "line": format_requirement_line(raw),
+                    "private": raw.startswith("-"),
+                }
+    return web.json_response(
+        {"channels": list(channels.values()), "groups": list(groups.values())}
+    )
 
 
 async def access_details(request: web.Request) -> web.Response:

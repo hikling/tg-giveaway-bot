@@ -13,7 +13,7 @@ from sqlalchemy import select
 from bot.callbacks.factories import ClaimCb
 from bot.db.models import Giveaway, GiveawayStatus, PrizeClaim, PrizeCode
 from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_INELIGIBLE, CLAIM_OK
-from bot.db.repo import log_winners, replace_tier_winners
+from bot.db.repo import ban_user, log_winners, replace_tier_winners
 from bot.handlers.prize import build_prize_router
 from bot.i18n import t
 from bot.services import prize as prize_service
@@ -234,3 +234,57 @@ async def test_long_prize_history_is_delivered_as_a_private_file(bot, sessionmak
     assert isinstance(document, BufferedInputFile)
     assert all(secret in document.data.decode("utf-8") for secret in secrets)
     assert bot.sent == []
+
+
+async def test_blacklisted_winner_cannot_claim_prize(bot, sessionmaker, due_giveaway):
+    gid = await due_giveaway(prize_mode="unique")
+    await prize_service.add_codes(gid, TIER, ["SECRET-FOR-CLEAN-WINNER"])
+    await _record_winners(sessionmaker, gid, [(WINNER, TIER)])
+    async with sessionmaker() as session:
+        await ban_user(session, WINNER, reason="abuse", banned_by=1)
+        await session.commit()
+
+    callback = SimpleNamespace(from_user=SimpleNamespace(id=WINNER), answer=AsyncMock())
+    await _handler("on_claim_button", event="callback_query")(
+        callback, ClaimCb(giveaway_id=gid, tier_index=0), bot
+    )
+    callback.answer.assert_awaited_once_with(t("join.banned"), show_alert=True)
+
+    message = _message(WINNER)
+    await _handler("on_claim_command")(
+        message, CommandObject(prefix="/", command="claim", args=str(gid)), bot, Mock()
+    )
+    message.answer.assert_awaited_once_with(t("join.banned"))
+
+    outcome = await prize_service.claim(gid, WINNER, TIER)
+    assert outcome.status == CLAIM_INELIGIBLE and outcome.code is None
+    assert (await prize_service.stock(gid))[TIER].remaining == 1
+    assert bot.sent == []
+
+
+async def test_publishing_finished_giveaway_cannot_release_prize(bot, sessionmaker, due_giveaway):
+    gid = await due_giveaway(prize_mode="unique", publishing=True)
+    await prize_service.add_codes(gid, TIER, ["STILL-PUBLISHING"])
+    await _record_winners(sessionmaker, gid, [(WINNER, TIER)])
+
+    callback = SimpleNamespace(from_user=SimpleNamespace(id=WINNER), answer=AsyncMock())
+    await _handler("on_claim_button", event="callback_query")(
+        callback, ClaimCb(giveaway_id=gid, tier_index=0), bot
+    )
+    callback.answer.assert_awaited_once_with(t("prize.not_drawn"), show_alert=True)
+
+    outcome = await prize_service.claim(gid, WINNER, TIER)
+    assert outcome.status == CLAIM_INELIGIBLE and outcome.code is None
+    assert bot.sent == []
+
+
+async def test_shared_text_update_delivers_latest_text(sessionmaker, due_giveaway):
+    gid = await due_giveaway(prize_mode="shared", prize_tiers=[{"name": TIER, "count": 2}])
+    await _record_winners(sessionmaker, gid, [(WINNER, TIER), (OTHER_USER, TIER)])
+    cap = prize_service.max_claims_for("shared")
+    await prize_service.add_codes(gid, TIER, ["OLD-SHARED"], max_claims=cap)
+    assert (await prize_service.claim(gid, WINNER, TIER)).code == "OLD-SHARED"
+
+    await prize_service.add_codes(gid, TIER, ["NEW-SHARED"], max_claims=cap)
+    second = await prize_service.claim(gid, OTHER_USER, TIER)
+    assert second.status == CLAIM_OK and second.code == "NEW-SHARED"

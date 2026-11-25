@@ -112,7 +112,7 @@ async def publish_all(bot: Bot, gid: int) -> PublicationResult:
                     reply_markup=participate_keyboard(gid, "zh"),
                     link_preview_options={"is_disabled": True},
                 )
-            except TelegramAPIError as exc:
+            except (TelegramAPIError, TimeoutError) as exc:
                 async with get_sessionmaker()() as session:
                     row = await session.get(GiveawayPost, (gid, chat_id))
                     row.send_error = type(exc).__name__

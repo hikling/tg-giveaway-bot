@@ -1169,6 +1169,10 @@ function renderCreate() {
     const fields = form.elements;
     const titleCounter = form.querySelector("#title-counter");
     const descCounter = form.querySelector("#desc-counter");
+    const channelsField = form.querySelector("#channels-field");
+    const groupsField = form.querySelector("#groups-field");
+    const channelsSaved = form.querySelector("#channels-saved");
+    const groupsSaved = form.querySelector("#groups-saved");
     const channelsPreview = form.querySelector("#channels-preview");
     const groupsPreview = form.querySelector("#groups-preview");
     const prizeSummaryPill = form.querySelector("#prize-summary-pill");
@@ -1183,11 +1187,68 @@ function renderCreate() {
         tg?.enableClosingConfirmation?.();
     }
 
+    function textareaLines(control) {
+        return control.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    }
+
+    function syncSavedPickStates() {
+        for (const [container, control] of [
+            [channelsSaved, fields.channels],
+            [groupsSaved, fields.groups],
+        ]) {
+            const current = new Set(textareaLines(control));
+            for (const pill of container.querySelectorAll("button[data-line]")) {
+                const selected = current.has(pill.dataset.line);
+                pill.setAttribute("aria-pressed", String(selected));
+            }
+        }
+    }
+
+    function renderSavedPicks(container, items, control, labelText) {
+        container.replaceChildren();
+        if (!items || !items.length) {
+            container.hidden = true;
+            return;
+        }
+        container.hidden = false;
+        container.append(element("span", labelText, "hint"));
+        const grid = element("div", undefined, "pick-grid");
+        for (const item of items) {
+            const pill = element("button", undefined, "pick-pill");
+            pill.type = "button";
+            pill.dataset.line = item.line;
+            pill.setAttribute("aria-pressed", "false");
+            pill.append(svgIcon("check"), element("span", item.name + (item.private ? " (私有)" : "")));
+            pill.addEventListener("click", () => {
+                const lines = textareaLines(control);
+                const idx = lines.indexOf(item.line);
+                if (idx >= 0) lines.splice(idx, 1);
+                else lines.push(item.line);
+                control.value = lines.join("\n");
+                haptic("selection");
+                markDirty();
+                syncCountersAndChips();
+            });
+            grid.append(pill);
+        }
+        container.append(grid);
+        syncSavedPickStates();
+    }
+
+    function updateLocationScope() {
+        const scope = fields.location_scope.value;
+        channelsField.hidden = scope === "groups";
+        groupsField.hidden = scope === "channels";
+        if (scope === "channels") builderKind.value = "channels";
+        else if (scope === "groups") builderKind.value = "groups";
+    }
+
     function syncCountersAndChips() {
         titleCounter.textContent = `${fields.title.value.length} / 256`;
         descCounter.textContent = `${fields.description.value.length} / 4096`;
         renderLocationChips(fields.channels.value, channelsPreview);
         renderLocationChips(fields.groups.value, groupsPreview);
+        syncSavedPickStates();
     }
 
     const stepSections = stepPills
@@ -1248,6 +1309,13 @@ function renderCreate() {
         }
         const target = fields[builderKind.value];
         target.value = target.value.trim() ? `${target.value.trim()}\n${ref}` : ref;
+        if (
+            (builderKind.value === "channels" && fields.location_scope.value === "groups")
+            || (builderKind.value === "groups" && fields.location_scope.value === "channels")
+        ) {
+            fields.location_scope.value = "both";
+            updateLocationScope();
+        }
         builderName.value = "";
         builderUrl.value = "";
         builderChatId.value = "";
@@ -1257,64 +1325,6 @@ function renderCreate() {
         syncCountersAndChips();
         haptic("success");
     });
-
-    function syncPresetHighlights() {
-        const durVal = fields.duration.value;
-        const durUnit = fields.duration_unit.value;
-        for (const btn of form.querySelectorAll("#duration-presets .chip-btn")) {
-            btn.classList.toggle("is-selected", btn.dataset.duration === durVal && btn.dataset.unit === durUnit);
-        }
-        const targetVal = fields.target.value;
-        for (const btn of form.querySelectorAll("#target-presets .chip-btn")) {
-            btn.classList.toggle("is-selected", btn.dataset.target === targetVal);
-        }
-    }
-
-    for (const btn of form.querySelectorAll("#duration-presets .chip-btn")) {
-        btn.addEventListener("click", () => {
-            fields.duration.value = btn.dataset.duration;
-            fields.duration_unit.value = btn.dataset.unit;
-            haptic("selection");
-            markDirty();
-            syncPresetHighlights();
-        });
-    }
-    for (const btn of form.querySelectorAll("#deadline-presets .chip-btn")) {
-        btn.addEventListener("click", () => {
-            const target = new Date();
-            if (btn.dataset.hours) {
-                target.setTime(target.getTime() + Number(btn.dataset.hours) * 3600000);
-            } else if (btn.dataset.evening !== undefined) {
-                const days = Number(btn.dataset.evening);
-                const nowLocal = formatLocalDateTimeInput(target, displayTimeZone);
-                const baseDate = new Date(nowLocal.slice(0, 10) + "T20:00");
-                if (!Number.isNaN(baseDate.getTime())) {
-                    const ymd = nowLocal.slice(0, 10);
-                    if (days === 0) {
-                        fields.deadline.value = `${ymd}T20:00`;
-                    } else {
-                        const tomorrow = new Date(target.getTime() + days * 86400000);
-                        const tLocal = formatLocalDateTimeInput(tomorrow, displayTimeZone);
-                        fields.deadline.value = `${tLocal.slice(0, 10)}T20:00`;
-                    }
-                    haptic("selection");
-                    markDirty();
-                    return;
-                }
-            }
-            fields.deadline.value = formatLocalDateTimeInput(target, displayTimeZone);
-            haptic("selection");
-            markDirty();
-        });
-    }
-    for (const btn of form.querySelectorAll("#target-presets .chip-btn")) {
-        btn.addEventListener("click", () => {
-            fields.target.value = btn.dataset.target;
-            haptic("selection");
-            markDirty();
-            syncPresetHighlights();
-        });
-    }
 
     function updateTime() {
         const timed = fields.draw_mode.value !== "count";
@@ -1336,7 +1346,6 @@ function renderCreate() {
                 displayTimeZone,
             );
         }
-        syncPresetHighlights();
     }
 
     function updateTiers() {
@@ -1502,6 +1511,7 @@ function renderCreate() {
     }
 
     function collectDraft() {
+        const scope = fields.location_scope.value;
         const timed = fields.draw_mode.value !== "count";
         const count = fields.draw_mode.value !== "time";
         const relative = fields.time_mode.value === "relative";
@@ -1511,8 +1521,8 @@ function renderCreate() {
         return {
             title: fields.title.value.trim(),
             description: fields.description.value,
-            channels: fields.channels.value,
-            groups: fields.groups.value,
+            channels: scope === "groups" ? "" : fields.channels.value,
+            groups: scope === "channels" ? "" : fields.groups.value,
             condition,
             prize_mode: fields.prize_mode.value,
             tiers: Array.from(tierList.children, tier => ({
@@ -1525,12 +1535,15 @@ function renderCreate() {
 
     form.addEventListener("input", () => {
         markDirty();
+        updateLocationScope();
         syncCountersAndChips();
         updateTime();
         updateTiers();
     });
     form.addEventListener("change", () => {
         markDirty();
+        updateLocationScope();
+        syncCountersAndChips();
         updateTime();
         updateTiers();
     });
@@ -1559,9 +1572,17 @@ function renderCreate() {
     });
 
     addTierRow(false);
+    updateLocationScope();
     syncCountersAndChips();
     updateTime();
     returnToForm();
+    api("/locations")
+        .then(data => {
+            if (!form.isConnected) return;
+            renderSavedPicks(channelsSaved, data.channels, fields.channels, "常用频道（可单选或多选）：");
+            renderSavedPicks(groupsSaved, data.groups, fields.groups, "常用群组（可单选或多选）：");
+        })
+        .catch(() => {});
 }
 
 function showPreview(draft, preview, returnToForm) {
