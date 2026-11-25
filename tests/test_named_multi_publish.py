@@ -351,3 +351,66 @@ async def test_creator_cannot_skip_all_destinations(sessionmaker):
     await _handler("step_groups")(message, state, PostingBot())
     assert await state.get_state() == GiveawayDraft.waiting_groups.state
     assert "至少" in message.answers[-1]
+
+
+async def test_refresh_running_post_counts_updates_posts_and_scheduler_runs_every_5_minutes(
+    sessionmaker,
+):
+    from aiogram.exceptions import TelegramBadRequest
+
+    from bot.db.repo import add_participant, ban_user
+    from bot.services.publication import refresh_running_post_counts
+
+    class EditableBot(PostingBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.edited: list[tuple[int, int, str, dict]] = []
+
+        async def edit_message_text(self, text: str, *, chat_id: int, message_id: int, **kwargs):
+            self.edited.append((chat_id, message_id, text, kwargs))
+
+    bot = EditableBot()
+    gw = await new_multi_game()
+    await publish_all(bot, gw.id)
+
+    # No new participants -> no redundant edit call
+    assert await refresh_running_post_counts(bot) == 0
+    assert bot.edited == []
+
+    # 2 valid participants + 1 blacklisted user -> post updates to 2
+    async with sessionmaker() as session:
+        await add_participant(session, giveaway_id=gw.id, user_id=1001, username="u1")
+        await add_participant(session, giveaway_id=gw.id, user_id=1002, username="u2")
+        await add_participant(session, giveaway_id=gw.id, user_id=1003, username="bad")
+        await ban_user(session, 1003, reason="spam", banned_by=1)
+        await session.commit()
+
+    assert await refresh_running_post_counts(bot) == 2
+    assert {chat_id for chat_id, _, _, _ in bot.edited} == {-100111, -100222}
+    for _chat_id, _msg_id, text, kwargs in bot.edited:
+        assert "已报名：2 人" in text
+        assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"join:{gw.id}"
+
+    # Unchanged count -> skipped on next tick
+    assert await refresh_running_post_counts(bot) == 0
+    assert len(bot.edited) == 2
+
+    # Simulates "message is not modified" after restart (empty cache)
+    from bot.services import publication
+
+    publication._last_displayed_counts.clear()
+
+    async def not_modified(*args, **kwargs):
+        raise TelegramBadRequest("editMessageText", "Bad Request: message is not modified")
+
+    bot.edit_message_text = not_modified
+    assert await refresh_running_post_counts(bot) == 0
+
+    scheduler = GiveawayScheduler(bot)
+    scheduler.start()
+    try:
+        job = scheduler._scheduler.get_job("giveaway-participant-counts")
+        assert job is not None
+        assert job.trigger.interval == timedelta(minutes=5)
+    finally:
+        scheduler.shutdown()

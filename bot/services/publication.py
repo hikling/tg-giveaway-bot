@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from sqlalchemy import select
 
 from bot.db.base import get_sessionmaker
@@ -24,6 +24,8 @@ from bot.utils.timeparse import format_draw_condition
 log = logging.getLogger(__name__)
 # 项目按单实例部署；串行发布/补发避免重复发送同一处待发消息。
 _publish_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# 记录每个已发抽奖帖最近一次展示的报名人数，避免人数未变化时重复调用编辑接口。
+_last_displayed_counts: dict[tuple[str, int, int, int], int] = {}
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,24 @@ class PublicationResult:
 
 def _expired(gw: Giveaway) -> bool:
     return gw.draw_mode != "count" and gw.end_at <= datetime.now(UTC)
+
+
+def render_running_post(gw: Giveaway, count: int) -> str:
+    return render(
+        "giveaway_running",
+        "zh",
+        id=gw.id,
+        title=gw.title,
+        description=gw.description,
+        prizes=gw.prize_tiers,
+        channels=[linked_requirement(x) for x in gw.required_channels or ()],
+        groups=[linked_requirement(x) for x in gw.required_groups or ()],
+        ends_at=format_draw_condition(
+            gw.end_at, gw.draw_mode, gw.target_participants, get_settings().tz
+        ),
+        count=count,
+        commit=gw.draw_commit,
+    )
 
 
 async def post_locations(
@@ -90,21 +110,7 @@ async def publish_all(bot: Bot, gid: int) -> PublicationResult:
                 if gw.status != GiveawayStatus.running or _expired(gw):
                     break
                 count = await count_participants(session, gid, exclude_blacklisted=True)
-                text = render(
-                    "giveaway_running",
-                    "zh",
-                    id=gid,
-                    title=gw.title,
-                    description=gw.description,
-                    prizes=gw.prize_tiers,
-                    channels=[linked_requirement(x) for x in gw.required_channels],
-                    groups=[linked_requirement(x) for x in gw.required_groups],
-                    ends_at=format_draw_condition(
-                        gw.end_at, gw.draw_mode, gw.target_participants, get_settings().tz
-                    ),
-                    count=count,
-                    commit=gw.draw_commit,
-                )
+                text = render_running_post(gw, count)
             try:
                 sent = await bot.send_message(
                     chat_id,
@@ -127,7 +133,9 @@ async def publish_all(bot: Bot, gid: int) -> PublicationResult:
                 if gw.chat_id is None:
                     # 保留旧版单目标字段，兼容旧公告与数据备份。
                     gw.chat_id, gw.message_id = chat_id, sent.message_id
+                commit_key = gw.draw_commit or ""
                 await session.commit()
+            _last_displayed_counts[(commit_key, gid, chat_id, sent.message_id)] = count
         async with get_sessionmaker()() as session:
             gw = await claim_giveaway(session, gid, GiveawayStatus.running)
             rows = (
@@ -149,3 +157,93 @@ async def publish_all(bot: Bot, gid: int) -> PublicationResult:
 
             await finalize_and_publish(gid, bot)
         return PublicationResult(gid, count, failed, canceled=count == 0)
+
+
+async def _edit_post_count(
+    bot: Bot,
+    *,
+    gid: int,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    markup,
+    cache_key: tuple[str, int, int, int],
+    count: int,
+) -> bool:
+    for attempt in range(2):
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=markup,
+                link_preview_options={"is_disabled": True},
+            )
+            _last_displayed_counts[cache_key] = count
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt == 0:
+                await asyncio.sleep(exc.retry_after)
+                continue
+            log.warning("刷新抽奖%s人数失败（TelegramRetryAfter）", gid)
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                _last_displayed_counts[cache_key] = count
+            else:
+                log.warning("刷新抽奖%s人数失败：%s", gid, exc)
+            return False
+        except (TelegramAPIError, TimeoutError) as exc:
+            log.warning("刷新抽奖%s人数失败（%s）", gid, type(exc).__name__)
+            return False
+    return False
+
+
+async def refresh_running_post_counts(bot: Bot) -> int:
+    """定时刷新进行中抽奖帖的已报名人数，避免帖子长期停留在 0 人。"""
+    async with get_sessionmaker()() as session:
+        running_ids = list(
+            await session.scalars(
+                select(Giveaway.id)
+                .where(Giveaway.status == GiveawayStatus.running, Giveaway.publishing.is_(False))
+                .order_by(Giveaway.id)
+            )
+        )
+    active_ids = set(running_ids)
+    for key in list(_last_displayed_counts):
+        if key[1] not in active_ids:
+            _last_displayed_counts.pop(key, None)
+
+    updated = 0
+    for gid in running_ids:
+        async with get_sessionmaker()() as session:
+            gw = await session.get(Giveaway, gid)
+            if gw is None or gw.status != GiveawayStatus.running or gw.publishing or _expired(gw):
+                continue
+            count = await count_participants(session, gid, exclude_blacklisted=True)
+            text = render_running_post(gw, count)
+            legacy_chat, legacy_msg = gw.chat_id, gw.message_id
+            commit_key = gw.draw_commit or ""
+
+        locations = await post_locations(gid, legacy_chat, legacy_msg)
+        targets = [
+            (chat_id, message_id)
+            for chat_id, message_id in locations
+            if _last_displayed_counts.get((commit_key, gid, chat_id, message_id)) != count
+        ]
+        if not targets:
+            continue
+
+        markup = participate_keyboard(gid, "zh")
+        for chat_id, message_id in targets:
+            if await _edit_post_count(
+                bot,
+                gid=gid,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                markup=markup,
+                cache_key=(commit_key, gid, chat_id, message_id),
+                count=count,
+            ):
+                updated += 1
+    return updated

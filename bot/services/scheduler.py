@@ -45,12 +45,23 @@ class GiveawayScheduler:
 
     def start(self) -> None:
         from bot.services.poetry import expire_due_questions
+        from bot.services.publication import refresh_running_post_counts
 
         self._scheduler.add_job(
             expire_due_questions,
             "interval",
             seconds=1,
             id="poetry-timeouts",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            kwargs={"bot": self._bot},
+        )
+        self._scheduler.add_job(
+            refresh_running_post_counts,
+            "interval",
+            minutes=5,
+            id="giveaway-participant-counts",
             replace_existing=True,
             coalesce=True,
             max_instances=1,
