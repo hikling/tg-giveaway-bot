@@ -108,6 +108,7 @@ def _install_sqlite_pragmas(engine: AsyncEngine) -> None:
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
         finally:
             cursor.close()
 
@@ -162,7 +163,14 @@ async def init_db(database_url: str) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         log.info("sqlite path: %s", db_path)
 
-    _engine = create_async_engine(database_url, future=True, echo=False, hide_parameters=True)
+    engine_kwargs: dict[str, object] = {
+        "future": True,
+        "echo": False,
+        "hide_parameters": True,
+    }
+    if database_url.startswith("sqlite"):
+        engine_kwargs["connect_args"] = {"timeout": 30}
+    _engine = create_async_engine(database_url, **engine_kwargs)
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
 
     if database_url.startswith("sqlite"):

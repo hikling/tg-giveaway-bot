@@ -214,6 +214,8 @@ async def _reroll_tier(
             if existing is None:
                 return [], None
             raise RerollError(existing.status.value)
+        if gw.publishing:
+            raise RerollError("running")
 
         count = _tier_count(gw.prize_tiers, tier_name)
         if count <= 0:

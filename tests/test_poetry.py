@@ -68,6 +68,40 @@ def test_bank_has_twenty_five_unambiguous_two_character_questions():
         assert all(len(x) == 2 for x in p.distractors)
         assert len({p.answer, *p.distractors}) == 4
         assert p.title and p.author
+        assert p.answer not in p.title
+
+
+async def test_bank_swap_replaces_inflight_question_without_charging_mistake(
+    sessionmaker, new_giveaway, bot
+):
+    gid = await new_giveaway()
+    challenge, _ = await begin(bot, gid)
+    # Simulate an in-flight question created before the poetry bank was replaced:
+    # its stored options no longer contain the current poem's answer.
+    async with sessionmaker() as session:
+        row = await session.get(PoetryAttempt, (gid, 1001))
+        row.options = ["旧甲", "旧乙", "旧丙", "旧丁"]
+        await session.commit()
+
+    query = cq(bot)
+    await handler("on_poetry")(
+        query, PoetryCb(giveaway_id=gid, nonce=challenge.nonce, choice=0)
+    )
+    assert "题库已更新" in query.answer.await_args.args[0]
+    refreshed = await stored(sessionmaker, gid)
+    assert refreshed.wrong_count == 0
+    assert refreshed.nonce != challenge.nonce
+    assert POEMS[refreshed.question_id].answer in refreshed.options
+
+    # Also verify reopening via get_challenge transparently replaces stale options.
+    async with sessionmaker() as session:
+        row = await session.get(PoetryAttempt, (gid, 1001))
+        row.options = ["旧甲", "旧乙", "旧丙", "旧丁"]
+        await session.commit()
+    replacement, _ = await begin(bot, gid)
+    assert replacement is not None
+    assert replacement.remaining == 5
+    assert POEMS[replacement.question_id].answer in replacement.options
 
 
 async def test_correct_answer_enters_without_another_join(sessionmaker, new_giveaway, bot):

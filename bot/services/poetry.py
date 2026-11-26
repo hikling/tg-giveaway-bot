@@ -84,8 +84,12 @@ async def get_challenge(session: AsyncSession, gid: int, uid: int) -> Challenge 
     expire_question(row)
     if row.wrong_count >= MAX_WRONG:
         return None
-    if not row.nonce or not 0 <= row.question_id < len(POEMS):
-        # 解封后若管理员已清除了旧报名，重新答题但保留历史错误次数。
+    if (
+        not row.nonce
+        or not 0 <= row.question_id < len(POEMS)
+        or POEMS[row.question_id].answer not in row.options
+    ):
+        # 解封后若管理员已清除了旧报名，或题库更新导致旧选项失效，重新答题但保留历史错误次数。
         await _next(session, row)
     return view(row)
 
@@ -106,7 +110,7 @@ async def answer(
         return "stale", None
     if expire_question(row):
         return ("locked" if row.wrong_count >= MAX_WRONG else "timeout"), None
-    if not 0 <= row.question_id < len(POEMS):
+    if not 0 <= row.question_id < len(POEMS) or POEMS[row.question_id].answer not in row.options:
         await _next(session, row)
         return "replaced", view(row)
     if row.options[choice] == POEMS[row.question_id].answer:

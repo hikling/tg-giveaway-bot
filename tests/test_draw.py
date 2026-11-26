@@ -368,3 +368,80 @@ async def test_replace_tier_winners_only_touches_one_tier(
 
         live = await current_winner_ids(session, gid)
     assert live == {1002}
+
+
+def test_draw_indices_is_statistically_uniform_and_unbiased():
+    """Verify partial Fisher-Yates draw has uniform slot frequency and no position bias."""
+    from bot.utils.antiabuse import draw_indices
+
+    n, k, trials = 20, 5, 4000
+    counts = [0] * n
+    for trial in range(trials):
+        picked = draw_indices(f"fairness-check-seed-{trial}", n, k)
+        assert len(picked) == k
+        assert len(set(picked)) == k
+        assert all(0 <= idx < n for idx in picked)
+        for idx in picked:
+            counts[idx] += 1
+
+    expected = trials * k / n  # 1000.0 per participant slot
+    chi_square = sum((obs - expected) ** 2 / expected for obs in counts)
+    # df=19; p < 0.0005 threshold is ~46.2 — deterministic seeds keep this stable.
+    assert chi_square < 45.0, f"non-uniform draw distribution: chi2={chi_square:.2f}, counts={counts}"
+    first_half = sum(counts[: n // 2])
+    second_half = sum(counts[n // 2 :])
+    assert abs(first_half - second_half) < 400
+
+
+async def test_large_multi_tier_draw_300_winners_no_duplicates_and_reproducible(
+    sessionmaker, due_giveaway, bot
+):
+    from bot.utils.antiabuse import draw_indices, make_commit, reveal_ok
+
+    seed, commit = make_commit()
+    tiers = [
+        {"name": "一等奖", "count": 50},
+        {"name": "二等奖", "count": 100},
+        {"name": "三等奖", "count": 150},
+    ]
+    gid = await due_giveaway(prize_tiers=tiers, draw_seed=seed, draw_commit=commit)
+    all_users = list(range(10_000, 10_505))
+    banned_users = {10_000, 10_100, 10_200, 10_300, 10_400}
+    async with sessionmaker() as session:
+        await _join(session, gid, all_users)
+        for uid in banned_users:
+            await ban_user(session, uid, reason="abuse", banned_by=1)
+        await session.commit()
+    await gw_service.attach_message(gid, chat_id=-100123, message_id=88)
+
+    await finalize_and_publish(gid, bot)
+
+    async with sessionmaker() as session:
+        gw = await get_giveaway(session, gid)
+        live = await list_winners(session, gid)
+
+    assert gw.status == GiveawayStatus.finished
+    assert reveal_ok(gw.draw_seed, gw.draw_commit)
+    assert len(live) == 300
+    winner_ids = [w.user_id for w in live]
+    assert len(set(winner_ids)) == 300
+    assert banned_users.isdisjoint(winner_ids)
+    assert [w.tier_name for w in live].count("一等奖") == 50
+    assert [w.tier_name for w in live].count("二等奖") == 100
+    assert [w.tier_name for w in live].count("三等奖") == 150
+
+    # Independent commit-reveal replay must reproduce the exact 300 winners.
+    eligible = sorted(uid for uid in all_users if uid not in banned_users)
+    expected: list[tuple[int, str]] = []
+    already: set[int] = set()
+    for tier in tiers:
+        pool = [uid for uid in eligible if uid not in already]
+        picks = [pool[i] for i in draw_indices(f"{seed}|{tier['name']}", len(pool), tier["count"])]
+        already.update(picks)
+        expected.extend((uid, tier["name"]) for uid in picks)
+    assert [(w.user_id, w.tier_name) for w in live] == expected
+
+    public_posts = [text for chat, text, _ in bot.sent if chat == -100123]
+    assert len(public_posts) == 4
+    assert all("<blockquote expandable>" in msg and "</blockquote>" in msg for msg in public_posts)
+    assert any(seed in msg for msg in public_posts)

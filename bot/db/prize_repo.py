@@ -128,13 +128,16 @@ async def add_codes(
 
 def _claimable_unique_codes(giveaway_id: int):
     """Only the first stocked copy of each unused code is available."""
+    claimed_code_ids = select(PrizeClaim.code_id).where(PrizeClaim.giveaway_id == giveaway_id)
     issued = select(PrizeCode.code).where(
-        PrizeCode.giveaway_id == giveaway_id, PrizeCode.claimed_count > 0
+        PrizeCode.giveaway_id == giveaway_id,
+        (PrizeCode.claimed_count > 0) | (PrizeCode.id.in_(claimed_code_ids)),
     )
     return (
         select(func.min(PrizeCode.id))
         .where(
             PrizeCode.giveaway_id == giveaway_id,
+            PrizeCode.claimed_count == 0,
             PrizeCode.claimed_count < PrizeCode.max_claims,
             PrizeCode.code.not_in(issued),
         )
@@ -218,19 +221,21 @@ async def claim_code(
     )
     if gw.prize_mode == "unique":
         # A pre-upgrade database may already contain repeated copies.
-        available = available.where(PrizeCode.id.in_(_claimable_unique_codes(giveaway_id)))
+        available = available.where(
+            PrizeCode.claimed_count == 0,
+            PrizeCode.id.in_(_claimable_unique_codes(giveaway_id)),
+        )
     row = await session.scalar(available.order_by(PrizeCode.id).limit(1))
     if row is None:
         return ClaimOutcome(CLAIM_EMPTY)
 
-    taken = await session.execute(
-        update(PrizeCode)
-        .where(
-            PrizeCode.id == row.id,
-            PrizeCode.claimed_count < PrizeCode.max_claims,
-        )
-        .values(claimed_count=PrizeCode.claimed_count + 1)
+    take_stmt = update(PrizeCode).where(
+        PrizeCode.id == row.id,
+        PrizeCode.claimed_count < PrizeCode.max_claims,
     )
+    if gw.prize_mode == "unique":
+        take_stmt = take_stmt.where(PrizeCode.claimed_count == 0)
+    taken = await session.execute(take_stmt.values(claimed_count=PrizeCode.claimed_count + 1))
     if taken.rowcount != 1:
         return ClaimOutcome(CLAIM_EMPTY)
 
@@ -267,6 +272,7 @@ async def my_prizes(session: AsyncSession, user_id: int) -> list[PrizeView]:
             .where(
                 PrizeClaim.user_id == user_id,
                 Giveaway.status == GiveawayStatus.finished,
+                Giveaway.publishing.is_(False),
                 PrizeCode.giveaway_id == PrizeClaim.giveaway_id,
                 PrizeCode.tier_name == PrizeClaim.tier_name,
             )

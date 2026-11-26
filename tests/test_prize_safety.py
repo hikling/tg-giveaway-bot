@@ -288,3 +288,81 @@ async def test_shared_text_update_delivers_latest_text(sessionmaker, due_giveawa
     await prize_service.add_codes(gid, TIER, ["NEW-SHARED"], max_claims=cap)
     second = await prize_service.claim(gid, OTHER_USER, TIER)
     assert second.status == CLAIM_OK and second.code == "NEW-SHARED"
+
+
+async def test_200_winners_concurrent_unique_code_claims_have_zero_duplicates(
+    sessionmaker, due_giveaway
+):
+    tier_a = "一等奖"
+    tier_b = "二等奖"
+    gid = await due_giveaway(
+        prize_mode="unique",
+        prize_tiers=[{"name": tier_a, "count": 80}, {"name": tier_b, "count": 120}],
+    )
+    winners_a = [(20_000 + i, tier_a) for i in range(80)]
+    winners_b = [(30_000 + i, tier_b) for i in range(120)]
+    codes_a = [f"A-CODE-{i:04d}" for i in range(80)]
+    codes_b = [f"B-CODE-{i:04d}" for i in range(120)]
+    await _record_winners(sessionmaker, gid, [*winners_a, *winners_b])
+    assert await prize_service.add_codes(gid, tier_a, codes_a) == 80
+    assert await prize_service.add_codes(gid, tier_b, codes_b) == 120
+
+    # Every one of the 200 winners fires two simultaneous claim requests (400 concurrent tasks).
+    requests = [
+        prize_service.claim(gid, uid, tier)
+        for uid, tier in [*winners_a, *winners_b]
+        for _ in range(2)
+    ]
+    outcomes = await asyncio.gather(*requests)
+
+    ok_outcomes = [o for o in outcomes if o.status == CLAIM_OK]
+    already_outcomes = [o for o in outcomes if o.status == CLAIM_ALREADY]
+    assert len(ok_outcomes) == 200
+    assert len(already_outcomes) == 200
+
+    delivered_codes = [o.code for o in ok_outcomes]
+    assert len(set(delivered_codes)) == 200
+    assert set(delivered_codes) == set(codes_a) | set(codes_b)
+
+    stock = await prize_service.stock(gid)
+    assert stock[tier_a].claimed == 80 and stock[tier_a].remaining == 0
+    assert stock[tier_b].claimed == 120 and stock[tier_b].remaining == 0
+
+    async with sessionmaker() as session:
+        claim_rows = (
+            await session.execute(
+                select(PrizeClaim.user_id, PrizeClaim.code_id).where(PrizeClaim.giveaway_id == gid)
+            )
+        ).all()
+        code_counts = (
+            await session.scalars(select(PrizeCode.claimed_count).where(PrizeCode.giveaway_id == gid))
+        ).all()
+    assert len(claim_rows) == 200
+    assert len({uid for uid, _ in claim_rows}) == 200
+    assert len({code_id for _, code_id in claim_rows}) == 200
+    assert all(count == 1 for count in code_counts)
+
+
+async def test_expired_undrawn_and_publishing_prizes_never_leak_through_claim_or_history(
+    bot, sessionmaker, due_giveaway
+):
+    # Past end_at, still status=running (timer hasn't drawn yet): cannot claim.
+    gid_undrawn = await due_giveaway(prize_mode="unique")
+    await prize_service.add_codes(gid_undrawn, TIER, ["SECRET-BEFORE-DRAW"])
+    await _record_winners(sessionmaker, gid_undrawn, [(WINNER, TIER)], status=GiveawayStatus.running)
+    assert (await prize_service.claim(gid_undrawn, WINNER, TIER)).status == CLAIM_INELIGIBLE
+
+    # Publishing=True even if status=finished: neither claim nor /myprizes may expose codes.
+    gid_pub = await due_giveaway(prize_mode="unique", publishing=True)
+    await prize_service.add_codes(gid_pub, TIER, ["SECRET-WHILE-PUBLISHING"])
+    await _record_winners(sessionmaker, gid_pub, [(WINNER, TIER)], status=GiveawayStatus.finished)
+    async with sessionmaker() as session:
+        code = await session.scalar(select(PrizeCode).where(PrizeCode.giveaway_id == gid_pub))
+        code.claimed_count = 1
+        session.add(PrizeClaim(giveaway_id=gid_pub, user_id=WINNER, tier_name=TIER, code_id=code.id))
+        await session.commit()
+
+    history = _message(WINNER)
+    await _handler("on_myprizes")(history, bot, Mock())
+    history.answer.assert_awaited_once_with(t("prize.myprizes_empty"))
+    assert bot.sent == []

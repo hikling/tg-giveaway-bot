@@ -66,8 +66,15 @@ async def test_concurrent_draws_produce_one_result(sessionmaker, due_giveaway, b
 async def test_long_winner_announcement_is_split_without_losing_winners(
     sessionmaker, due_giveaway, bot
 ):
-    members = range(1001, 1071)
-    gid = await due_giveaway(prize_tiers=[{"name": "奖" * 64, "count": len(members)}])
+    tier_a = "奖" * 64
+    tier_b = "二等奖"
+    members = list(range(1001, 1261))
+    gid = await due_giveaway(
+        prize_tiers=[
+            {"name": tier_a, "count": 180},
+            {"name": tier_b, "count": 80},
+        ]
+    )
     async with sessionmaker() as session:
         for user_id in members:
             await add_participant(session, giveaway_id=gid, user_id=user_id, username=None)
@@ -77,12 +84,72 @@ async def test_long_winner_announcement_is_split_without_losing_winners(
     await gw_service.finalize_and_publish(gid, bot)
 
     public_posts = [(message, args) for chat, message, args in bot.sent if chat == -100123]
-    assert len(public_posts) > 1
+    assert len(public_posts) == 3
     for message, args in public_posts:
         assert telegram_text_length(message) <= 4096
         assert args["reply_to_message_id"] == 7
+        assert message.count("<blockquote expandable>") == 1
+        assert message.count("</blockquote>") == 1
+        assert message.count('tg://user?id=') <= 90
     announcement = "\n".join(message for message, _ in public_posts)
     assert all(announcement.count(f'tg://user?id={user_id}"') == 1 for user_id in members)
+
+
+async def test_seventy_winners_collapse_into_one_expandable_blockquote(
+    sessionmaker, due_giveaway, bot
+):
+    members = range(1001, 1071)
+    gid = await due_giveaway(prize_tiers=[{"name": "一等奖", "count": len(members)}])
+    async with sessionmaker() as session:
+        for user_id in members:
+            await add_participant(session, giveaway_id=gid, user_id=user_id, username=None)
+        await session.commit()
+    await gw_service.attach_message(gid, chat_id=-100123, message_id=9)
+
+    await gw_service.finalize_and_publish(gid, bot)
+
+    public_posts = [(message, args) for chat, message, args in bot.sent if chat == -100123]
+    assert len(public_posts) == 1
+    message, args = public_posts[0]
+    assert args["reply_to_message_id"] == 9
+    assert telegram_text_length(message) <= 4096
+    assert "<blockquote expandable>" in message and "</blockquote>" in message
+    assert "共 70 人" in message
+    assert all(message.count(f'tg://user?id={user_id}"') == 1 for user_id in members)
+
+
+async def test_winner_dm_retries_after_telegram_flood_limit(
+    sessionmaker, due_giveaway, bot, monkeypatch
+):
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import SendMessage
+
+    gid = await due_giveaway()
+    async with sessionmaker() as session:
+        await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
+        await session.commit()
+
+    attempts = 0
+    original_send = bot.send_message
+
+    async def flaky_send(chat_id, text, **kwargs):
+        nonlocal attempts
+        if chat_id == 1001 and attempts == 0:
+            attempts += 1
+            raise TelegramRetryAfter(
+                method=SendMessage(chat_id=chat_id, text=text),
+                message="Flood control exceeded",
+                retry_after=0,
+            )
+        await original_send(chat_id, text, **kwargs)
+
+    monkeypatch.setattr(bot, "send_message", flaky_send)
+    await gw_service.finalize_and_publish(gid, bot)
+
+    assert attempts == 1
+    assert len([m for m in bot.sent if m[0] == 1001]) == 1
+    async with sessionmaker() as session:
+        assert not await pending_notifications(session, gid)
 
 
 async def test_failed_draw_rolls_back_its_status_claim(

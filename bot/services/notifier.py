@@ -6,6 +6,7 @@ from collections.abc import Iterator, Sequence
 from weakref import WeakValueDictionary
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.callbacks.factories import ClaimCb
@@ -25,6 +26,12 @@ from bot.utils.esc import esc, telegram_text_length, user_mention
 log = logging.getLogger("bot.services.notifier")
 
 NL = "\n"
+MAX_TELEGRAM_TEXT_LENGTH = 4096
+# Telegram enforces a 100-entity cap per message; keep 1 blockquote entity +
+# at most 90 mention link entities so every collapsible block and link renders.
+MAX_MENTIONS_PER_MESSAGE = 90
+MENTIONS_PER_LINE = 4
+MAX_SEND_RETRIES = 2
 _winner_delivery_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
 
 
@@ -33,12 +40,25 @@ def winner_delivery_lock(giveaway_id: int) -> asyncio.Lock:
     return _winner_delivery_locks.setdefault(giveaway_id, asyncio.Lock())
 
 
+async def _send_with_retry(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
+    for attempt in range(MAX_SEND_RETRIES + 1):
+        try:
+            await bot.send_message(chat_id, text, **kwargs)
+            return
+        except TelegramRetryAfter as exc:
+            if attempt >= MAX_SEND_RETRIES:
+                raise
+            delay = max(float(getattr(exc, "retry_after", 1) or 1), 0.1)
+            log.warning("Telegram flood limit for chat %s, sleeping %.1fs", chat_id, delay)
+            await asyncio.sleep(delay)
+
+
 def _announcement_batches(lines: Sequence[str]) -> Iterator[str]:
     batch: list[str] = []
     size = 0
     for line in lines:
         length = telegram_text_length(line)
-        if batch and size + 1 + length > 4096:
+        if batch and size + 1 + length > MAX_TELEGRAM_TEXT_LENGTH:
             yield NL.join(batch)
             batch = []
             size = 0
@@ -46,6 +66,180 @@ def _announcement_batches(lines: Sequence[str]) -> Iterator[str]:
         batch.append(line)
     if batch:
         yield NL.join(batch)
+
+
+def _expandable_quote(body: str) -> str:
+    return f"<blockquote expandable>{body}</blockquote>"
+
+
+def _build_announcement_messages(
+    giveaway: GiveawayView,
+    winners: Sequence[tuple[int, str]],
+    *,
+    shortfalls: Sequence[TierShortfall],
+    reason: str,
+    reveal_round: int | None,
+    pool_digest: str | None,
+    default_lang: str,
+) -> list[str]:
+    """Build compact collapsible public winner announcements for Telegram HTML.
+
+    Large draws (hundreds of winners) are grouped by tier, packed multiple
+    mentions per line, and wrapped in Telegram ``<blockquote expandable>``
+    blocks so channel/group posts stay compact until expanded while obeying
+    both Telegram's 4096 UTF-16 char limit and 100-entity limit per message.
+    """
+    header_prefix: list[str] = []
+    if reason != "draw":
+        header_prefix.append(t("giveaway.reroll_header", default_lang, id=giveaway.id))
+    finished_header = t("giveaway.finished_header", default_lang, id=giveaway.id)
+    header_prefix.append(finished_header)
+
+    reveal_text = ""
+    if giveaway.draw_commit:
+        # Commit-reveal: the hash was printed when the giveaway opened, the seed
+        # appears only here, so everybody can replay the draw.
+        reveal_text = t(
+            "giveaway.reveal_line",
+            default_lang,
+            seed=giveaway.draw_seed or "-",
+            commit=giveaway.draw_commit,
+            digest=pool_digest or "-",
+            round=reveal_round or 1,
+        ).strip()
+
+    shortfall_lines = [
+        t(
+            "giveaway.tier_short",
+            default_lang,
+            tier=short.tier,
+            requested=short.requested,
+            granted=short.granted,
+            missing=short.missing,
+        ).rstrip()
+        for short in shortfalls
+    ]
+
+    if not winners:
+        lines = [
+            *header_prefix,
+            t(
+                "giveaway.no_participants" if reason == "draw" else "giveaway.no_winners",
+                default_lang,
+            ),
+            *shortfall_lines,
+        ]
+        if reveal_text:
+            lines.append(_expandable_quote(reveal_text))
+        return list(_announcement_batches(lines))
+
+    grouped: dict[str, list[int]] = {}
+    for user_id, tier in winners:
+        grouped.setdefault(tier, []).append(user_id)
+
+    winners_header = t("giveaway.winners_header", default_lang).rstrip(":：")
+    total_winners = len(winners)
+
+    def _page_header(page_no: int, total_pages: int) -> str:
+        if page_no == 1:
+            if total_pages == 1:
+                summary = f"🎉 {winners_header}（共 {total_winners} 人，点击下方展开）"
+            else:
+                summary = (
+                    f"🎉 {winners_header}（共 {total_winners} 人，"
+                    f"第 {page_no}/{total_pages} 页，点击下方展开）"
+                )
+            return NL.join([*header_prefix, summary])
+        return f"{finished_header} · {winners_header}（第 {page_no}/{total_pages} 页，点击下方展开）"
+
+    # Reserve enough space for the longest possible header (including multi-page label).
+    max_header_len = max(
+        telegram_text_length(_page_header(1, 999)),
+        telegram_text_length(_page_header(999, 999)),
+    )
+    max_body_len = MAX_TELEGRAM_TEXT_LENGTH - max_header_len - 1
+
+    batches: list[list[str]] = []
+    current_lines: list[str] = []
+    current_len = 0
+    current_mentions = 0
+
+    def _flush() -> None:
+        nonlocal current_lines, current_len, current_mentions
+        if current_lines:
+            batches.append(current_lines)
+            current_lines = []
+            current_len = 0
+            current_mentions = 0
+
+    for tier, uids in grouped.items():
+        tier_header = f"• {esc(tier)}（{len(uids)} 人）："
+        cont_header = f"• {esc(tier)}（续）："
+        for idx in range(0, len(uids), MENTIONS_PER_LINE):
+            chunk = uids[idx : idx + MENTIONS_PER_LINE]
+            mention_line = "、".join(user_mention(uid) for uid in chunk)
+            chunk_mentions = len(chunk)
+
+            if idx == 0:
+                unit_lines = [tier_header, mention_line]
+                unit_len = telegram_text_length(NL.join(unit_lines))
+                added_len = (1 + unit_len) if current_lines else unit_len
+                if current_lines and (
+                    current_mentions + chunk_mentions > MAX_MENTIONS_PER_MESSAGE
+                    or current_len + added_len > max_body_len
+                ):
+                    _flush()
+                    added_len = unit_len
+                current_lines.extend(unit_lines)
+                current_len += added_len
+                current_mentions += chunk_mentions
+            else:
+                line_len = telegram_text_length(mention_line)
+                added_len = (1 + line_len) if current_lines else line_len
+                if current_lines and (
+                    current_mentions + chunk_mentions > MAX_MENTIONS_PER_MESSAGE
+                    or current_len + added_len > max_body_len
+                ):
+                    _flush()
+                    cont_lines = [cont_header, mention_line]
+                    current_lines.extend(cont_lines)
+                    current_len = telegram_text_length(NL.join(cont_lines))
+                    current_mentions = chunk_mentions
+                else:
+                    current_lines.append(mention_line)
+                    current_len += added_len
+                    current_mentions += chunk_mentions
+    _flush()
+
+    total_pages = len(batches)
+    messages: list[str] = []
+    for page_no, body_lines in enumerate(batches, start=1):
+        header = _page_header(page_no, total_pages)
+        body = NL.join(body_lines)
+        messages.append(f"{header}\n{_expandable_quote(body)}")
+
+    trailing_messages: list[str] = []
+    if reveal_text:
+        last_body = NL.join(batches[-1])
+        combined_body = f"{last_body}\n\n{reveal_text}"
+        candidate = f"{_page_header(total_pages, total_pages)}\n{_expandable_quote(combined_body)}"
+        if telegram_text_length(candidate) <= MAX_TELEGRAM_TEXT_LENGTH:
+            messages[-1] = candidate
+        else:
+            trailing_messages.append(_expandable_quote(reveal_text))
+
+    if shortfall_lines:
+        shortfall_block = NL.join(shortfall_lines)
+        if (
+            not trailing_messages
+            and telegram_text_length(f"{messages[-1]}\n{shortfall_block}")
+            <= MAX_TELEGRAM_TEXT_LENGTH
+        ):
+            messages[-1] = f"{messages[-1]}\n{shortfall_block}"
+        else:
+            trailing_messages.extend(_announcement_batches(shortfall_lines))
+
+    return [*messages, *trailing_messages]
 
 
 async def _winner_langs(session, winner_ids: Sequence[int]) -> dict[int, str]:
@@ -123,48 +317,15 @@ async def publish_winners(
         winner_langs = await _winner_langs(session, [w[0] for w in winners])
 
     # 1. public announcement, replied under the giveaway post
-    lines = []
-    if reason != "draw":
-        lines.append(t("giveaway.reroll_header", default_lang, id=giveaway.id))
-    lines.append(t("giveaway.finished_header", default_lang, id=giveaway.id))
-    if not winners:
-        lines.append(
-            t(
-                "giveaway.no_participants" if reason == "draw" else "giveaway.no_winners",
-                default_lang,
-            )
-        )
-    else:
-        lines.append(t("giveaway.winners_header", default_lang))
-        for user_id, tier in winners:
-            lines.append(
-                t("giveaway.winner_line", default_lang, tier=tier, mention=user_mention(user_id))
-            )
-    if giveaway.draw_commit:
-        # Commit-reveal: the hash was printed when the giveaway opened, the seed
-        # appears only here, so everybody can replay the draw.
-        lines.append(
-            t(
-                "giveaway.reveal_line",
-                default_lang,
-                seed=giveaway.draw_seed or "-",
-                commit=giveaway.draw_commit,
-                digest=pool_digest or "-",
-                round=reveal_round or 1,
-            )
-        )
-    for short in shortfalls:
-        lines.append(
-            t(
-                "giveaway.tier_short",
-                default_lang,
-                tier=short.tier,
-                requested=short.requested,
-                granted=short.granted,
-                missing=short.missing,
-            )
-        )
-    messages = list(_announcement_batches(lines))
+    messages = _build_announcement_messages(
+        giveaway,
+        winners,
+        shortfalls=shortfalls,
+        reason=reason,
+        reveal_round=reveal_round,
+        pool_digest=pool_digest,
+        default_lang=default_lang,
+    )
 
     from bot.services.publication import (
         cancel_post_count_sync,
@@ -180,7 +341,8 @@ async def publish_winners(
     ):
         for text in messages:
             try:
-                await bot.send_message(
+                await _send_with_retry(
+                    bot,
                     chat_id,
                     text,
                     reply_to_message_id=message_id,
@@ -209,8 +371,11 @@ async def publish_winners(
         error: str | None = None
         ok = True
         try:
-            await bot.send_message(
-                user_id, body, reply_markup=_claim_keyboard(giveaway, tier, winner_lang)
+            await _send_with_retry(
+                bot,
+                user_id,
+                body,
+                reply_markup=_claim_keyboard(giveaway, tier, winner_lang),
             )
         except Exception as exc:
             ok = False
@@ -283,8 +448,11 @@ async def _retry_pending(bot: Bot, giveaway_id: int) -> int:
         try:
             # A retried DM must carry the claim button too, otherwise a winner
             # whose first DM failed could never collect their prize.
-            await bot.send_message(
-                user_id, body, reply_markup=_claim_keyboard(giveaway, tier, winner_lang)
+            await _send_with_retry(
+                bot,
+                user_id,
+                body,
+                reply_markup=_claim_keyboard(giveaway, tier, winner_lang),
             )
             sent += 1
         except Exception as exc:
