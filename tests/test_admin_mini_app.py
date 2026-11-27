@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import re
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import urlencode
@@ -77,6 +79,7 @@ async def test_enabled_mini_app_serves_page_and_assets(mini_app):
     client, _, _ = mini_app
     response = await client.get("/admin/")
     assert response.status == 200 and response.content_type == "text/html"
+    assert response.headers["Cache-Control"] == "no-store"
     page = await response.text()
     assert 'name="prize_mode" value="shared"' not in page
     expected_assets = {
@@ -84,10 +87,12 @@ async def test_enabled_mini_app_serves_page_and_assets(mini_app):
         "/admin/assets/app.js": {"application/javascript", "text/javascript"},
     }
     for path, content_types in expected_assets.items():
-        assert path in page
-        response = await client.get(path)
+        version = re.search(rf'"{re.escape(path)}\?v=([0-9a-f]{{16}})"', page)
+        assert version is not None
+        response = await client.get(f"{path}?v={version[1]}")
         assert response.status == 200 and response.content_type in content_types
-        assert await response.read()
+        content = await response.read()
+        assert sha256(content).hexdigest()[:16] == version[1]
 
 
 async def test_disabled_mini_app_preserves_health_route():

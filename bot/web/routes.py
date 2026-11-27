@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import cache
+from hashlib import sha256
 from pathlib import Path
 
 from aiohttp import web
@@ -10,9 +12,21 @@ log = logging.getLogger("bot.web.routes")
 _ADMIN_ASSETS = Path(__file__).with_name("admin_assets")
 
 
-async def admin_page(_request: web.Request) -> web.FileResponse:
-    return web.FileResponse(
-        _ADMIN_ASSETS / "index.html",
+@cache
+def _admin_html() -> str:
+    html = (_ADMIN_ASSETS / "index.html").read_text(encoding="utf-8")
+    # Use new asset URLs after an update even when a CDN overrides browser cache headers.
+    for name in ("app.css", "app.js"):
+        url = f"/admin/assets/{name}"
+        version = sha256((_ADMIN_ASSETS / name).read_bytes()).hexdigest()[:16]
+        html = html.replace(f'"{url}"', f'"{url}?v={version}"')
+    return html
+
+
+async def admin_page(_request: web.Request) -> web.Response:
+    return web.Response(
+        text=_admin_html(),
+        content_type="text/html",
         headers={
             "Cache-Control": "no-store",
             "Content-Security-Policy": (
