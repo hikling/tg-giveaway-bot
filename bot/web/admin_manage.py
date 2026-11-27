@@ -191,9 +191,8 @@ async def giveaway_detail(request: web.Request) -> web.Response:
         ).all()
         claimed_pairs = {(uid, tier) for uid, tier in claim_rows}
         claimed_tiers = {tier for _, tier in claim_rows}
-        winner_rows = (
-            await list_winners(session, gid) if gw.status == GiveawayStatus.finished else []
-        )
+        drawn = gw.status == GiveawayStatus.finished and not gw.publishing
+        winner_rows = await list_winners(session, gid) if drawn else []
         winner_names = await get_user_names(session, [row.user_id for row in winner_rows])
     if gw.chat_id and gw.message_id:
         posts.setdefault(gw.chat_id, {"name": f"聊天 {gw.chat_id}", "sent": True, "error": None})
@@ -211,7 +210,7 @@ async def giveaway_detail(request: web.Request) -> web.Response:
                 "remaining": inventory.remaining if inventory else 0,
                 "recoverable": inventory.recoverable if inventory else 0,
                 "withdrawn": inventory.withdrawn if inventory else 0,
-                "rerollable": gw.status == GiveawayStatus.finished and name not in claimed_tiers,
+                "rerollable": drawn and name not in claimed_tiers,
             }
         )
     cutoff = datetime.now(UTC) - CLAIM_WINDOW
@@ -252,10 +251,10 @@ async def giveaway_detail(request: web.Request) -> web.Response:
                 ],
             },
             "posts": list(posts.values()),
-            "pending_notifications": len(pending),
+            "pending_notifications": len(pending) if drawn else 0,
             "winners": winners,
             "draw_commit": gw.draw_commit,
-            "draw_seed": gw.draw_seed if gw.status == GiveawayStatus.finished else None,
+            "draw_seed": gw.draw_seed if drawn else None,
             "gate": {**_gate(settings), "distribution": _distribution(ids, settings.min_user_id)},
         }
     )
@@ -279,9 +278,12 @@ async def _stock_action(gw: Giveaway, payload: GiveawayAction, tier: str) -> dic
         if count < len(codes):
             message += f" 已跳过 {len(codes) - count} 条重复独立码。"
         return {"message": message, "count": count}
-    count = await prize_service.add_codes(
-        gw.id, tier, codes, max_claims=prize_service.max_claims_for(gw.prize_mode)
-    )
+    try:
+        count = await prize_service.add_codes(
+            gw.id, tier, codes, max_claims=prize_service.max_claims_for(gw.prize_mode)
+        )
+    except prize_service.StockUnavailable as exc:
+        raise AdminError("这场抽奖已无法补充该奖项。", status=409) from exc
     message = f"已为「{tier}」补充 {count} 份奖品。"
     if count < len(codes):
         message += f" 已跳过 {len(codes) - count} 条重复独立码。"

@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import case, delete, func, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,12 +109,22 @@ async def add_codes(
     else:
         codes = normalize_codes(codes)
         if codes:
-            # 共享文本更新时移除尚未领取的旧行，并将已领取旧行封顶，确保后续中奖者拿到最新文本。
+            # Honor old claim rows even when an earlier version left the stock counter at zero.
+            claim_count = (
+                select(func.count(PrizeClaim.id))
+                .where(PrizeClaim.code_id == PrizeCode.id)
+                .correlate(PrizeCode)
+                .scalar_subquery()
+            )
+            used = (PrizeCode.claimed_count > 0) | (claim_count > 0)
+            consumed = case(
+                (claim_count > PrizeCode.claimed_count, claim_count), else_=PrizeCode.claimed_count
+            )
             await session.execute(
                 delete(PrizeCode).where(
                     PrizeCode.giveaway_id == giveaway_id,
                     PrizeCode.tier_name == tier,
-                    PrizeCode.claimed_count == 0,
+                    ~used,
                 )
             )
             await session.execute(
@@ -122,9 +132,9 @@ async def add_codes(
                 .where(
                     PrizeCode.giveaway_id == giveaway_id,
                     PrizeCode.tier_name == tier,
-                    PrizeCode.claimed_count > 0,
+                    used,
                 )
-                .values(max_claims=PrizeCode.claimed_count)
+                .values(max_claims=consumed, claimed_count=consumed)
             )
     for code in codes:
         session.add(
@@ -183,6 +193,7 @@ def _recoverable_tiers(giveaway_id: int, now: datetime):
         .where(
             WinnerLog.giveaway_id == giveaway_id,
             ~_winner_has_claim(),
+            or_(WinnerLog.replaced_at.is_(None), WinnerLog.replaced_at > WinnerLog.drawn_at),
         )
         .group_by(WinnerLog.tier_name)
         .having(
@@ -260,14 +271,22 @@ async def stock_by_tier(session: AsyncSession, giveaway_id: int) -> dict[str, Ti
 
 
 async def has_claim(
-    session: AsyncSession, *, giveaway_id: int, tier_name: str, user_id: int | None = None
+    session: AsyncSession, *, giveaway_id: int, tier_name: str | None = None, user_id: int | None = None
 ) -> bool:
-    query = select(PrizeClaim.id).where(
-        PrizeClaim.giveaway_id == giveaway_id, PrizeClaim.tier_name == tier_name.strip()[:64]
-    )
+    query = select(PrizeClaim.id).where(PrizeClaim.giveaway_id == giveaway_id)
+    if tier_name is not None:
+        query = query.where(PrizeClaim.tier_name == tier_name.strip()[:64])
     if user_id is not None:
         query = query.where(PrizeClaim.user_id == user_id)
     return await session.scalar(query.limit(1)) is not None
+
+
+async def claimed_user_ids(session: AsyncSession, giveaway_id: int) -> set[int]:
+    return set(
+        await session.scalars(
+            select(PrizeClaim.user_id).where(PrizeClaim.giveaway_id == giveaway_id).distinct()
+        )
+    )
 
 
 async def current_winner_tiers(
@@ -319,7 +338,8 @@ async def claim_code(
     winner = (await current_winner_claims(session, giveaway_id, user_id)).get(tier)
     if winner is None:
         return ClaimOutcome(CLAIM_INELIGIBLE)
-    if winner.claimed:
+    # Old databases can contain multiple live awards for one user across tiers.
+    if winner.claimed or await has_claim(session, giveaway_id=giveaway_id, user_id=user_id):
         return ClaimOutcome(CLAIM_ALREADY)
     now = datetime.now(UTC)
     if winner.deadline <= now:
@@ -362,9 +382,10 @@ async def claim_code(
     try:
         await session.flush()
     except IntegrityError:
-        # Same winner, same tier, twice: rollback also undoes the counter.
         await session.rollback()
-        return ClaimOutcome(CLAIM_ALREADY)
+        if await has_claim(session, giveaway_id=giveaway_id, tier_name=tier, user_id=user_id):
+            return ClaimOutcome(CLAIM_ALREADY)
+        raise
     return ClaimOutcome(CLAIM_OK, row.code)
 
 
@@ -385,8 +406,21 @@ async def my_prizes(session: AsyncSession, user_id: int) -> list[PrizeView]:
                 PrizeClaim.user_id == user_id,
                 Giveaway.status == GiveawayStatus.finished,
                 Giveaway.publishing.is_(False),
+                Giveaway.prize_mode.in_(SELF_SERVICE_MODES),
                 PrizeCode.giveaway_id == PrizeClaim.giveaway_id,
                 PrizeCode.tier_name == PrizeClaim.tier_name,
+                select(WinnerLog.id)
+                .where(
+                    WinnerLog.giveaway_id == PrizeClaim.giveaway_id,
+                    WinnerLog.user_id == PrizeClaim.user_id,
+                    WinnerLog.tier_name == PrizeClaim.tier_name,
+                    WinnerLog.drawn_at <= PrizeClaim.claimed_at,
+                    or_(
+                        WinnerLog.replaced_at.is_(None),
+                        PrizeClaim.claimed_at < WinnerLog.replaced_at,
+                    ),
+                )
+                .exists(),
             )
             .order_by(PrizeClaim.claimed_at.desc(), PrizeClaim.id.desc())
         )

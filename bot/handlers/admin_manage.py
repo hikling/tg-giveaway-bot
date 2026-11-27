@@ -28,6 +28,7 @@ from bot.services.notifier import retry_pending
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
 from bot.utils.esc import esc, user_mention
+from bot.utils.ids import parse_id
 from bot.utils.timeparse import format_draw_condition
 
 log = logging.getLogger("bot.handlers.admin_manage")
@@ -36,10 +37,7 @@ log = logging.getLogger("bot.handlers.admin_manage")
 def _int_arg(text: str) -> int | None:
     """First whitespace-separated token as an int, or None."""
     head = text.strip().split(maxsplit=1)[0] if text.strip() else ""
-    try:
-        return int(head)
-    except ValueError:
-        return None
+    return parse_id(head)
 
 
 def build_admin_manage_router() -> Router:
@@ -129,10 +127,10 @@ def build_admin_manage_router() -> Router:
             await answer_notice(message, t("admin.usage_reroll", lang), scheduler)
             return
         parts = command.args.split(maxsplit=1)
-        if len(parts) < 2 or not parts[0].isdigit():
+        gid = parse_id(parts[0]) if parts else None
+        if len(parts) < 2 or gid is None:
             await answer_notice(message, t("admin.usage_reroll", lang), scheduler)
             return
-        gid = int(parts[0])
         tier = parts[1].strip()
         try:
             picks, shortfall = await gw_service.reroll_tier(gid, tier, bot)

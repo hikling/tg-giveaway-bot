@@ -158,6 +158,7 @@ prize:
   stock_header: '📦 抽奖 #{id} 的奖池:'
   stock_row: • {tier}:共 {total} / 已领 {claimed} / 剩余 {remaining}
   stock_empty: '抽奖 #{id} 还没有录入任何奖品。'
+  stock_unavailable: 这场抽奖已无法补充该奖项。
   recovery_stock: '已回收待取回 {recoverable} 条 · 已取回 {withdrawn} 条'
   reclaim_hint: '主办方可私聊发送 <code>/reclaim {id}</code> 下载回收的独立码。'
   reclaim_usage: '请发送 <code>/reclaim 抽奖编号</code>，例如 <code>/reclaim 8</code>。'
@@ -309,6 +310,7 @@ fsm:
 
     确认数量后发送「确认」发布。数量不对可点「全部删除并重新添加」，或发送 /cancel 放弃。'
   saved: '✅ 抽奖已发布,保留本条消息可用于管理:'
+  publish_retry_saved: '抽奖 #{id} 已保存，发布结果尚未确认。发送「确认」继续同一场抽奖。'
   enter_groups: '必加群组（5/8），每行一个：
 
     交流群 | https://t.me/群组名

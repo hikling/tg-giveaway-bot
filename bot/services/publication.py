@@ -168,6 +168,21 @@ async def publish_all(bot: Bot, gid: int) -> PublicationResult:
         return PublicationResult(gid, count, failed, canceled=count == 0)
 
 
+async def publish_created(bot: Bot, giveaway: Giveaway) -> PublicationResult:
+    if giveaway.status == GiveawayStatus.running and giveaway.publishing:
+        return await publish_all(bot, giveaway.id)
+    async with get_sessionmaker()() as session:
+        posts = (
+            await session.scalars(select(GiveawayPost).where(GiveawayPost.giveaway_id == giveaway.id))
+        ).all()
+    return PublicationResult(
+        giveaway.id,
+        sum(post.message_id is not None for post in posts),
+        tuple(post.label for post in posts if post.message_id is None),
+        canceled=giveaway.status == GiveawayStatus.canceled,
+    )
+
+
 async def _edit_post_count(
     bot: Bot,
     *,

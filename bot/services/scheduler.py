@@ -8,8 +8,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from sqlalchemy import select
 
 from bot.db.base import get_sessionmaker
+from bot.db.models import Giveaway, GiveawayStatus
 from bot.db.repo import list_running_giveaways
 
 log = logging.getLogger("bot.services.scheduler")
@@ -67,6 +69,15 @@ class GiveawayScheduler:
             max_instances=1,
             kwargs={"bot": self._bot},
         )
+        self._scheduler.add_job(
+            self.finalize_overdue,
+            "interval",
+            minutes=1,
+            id="giveaway-overdue-draws",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
         self._shutdown_requested = False
         self._scheduler.start()
         log.info("scheduler started (tz=%s)", self._tz)
@@ -101,6 +112,27 @@ class GiveawayScheduler:
                 await restore_count_draw(gw.id, self._bot)
         await expire_due_questions(self._bot)
         await refresh_running_post_counts(self._bot)
+
+    async def finalize_overdue(self) -> None:
+        """Retry due time draws that a failed or missed one-off job left open."""
+        from bot.services.giveaway import finalize_and_publish
+
+        async with get_sessionmaker()() as session:
+            overdue = (
+                await session.scalars(
+                    select(Giveaway.id).where(
+                        Giveaway.status == GiveawayStatus.running,
+                        Giveaway.publishing.is_(False),
+                        Giveaway.draw_mode.in_(("time", "either")),
+                        Giveaway.end_at <= datetime.now(UTC),
+                    )
+                )
+            ).all()
+        for gid in overdue:
+            try:
+                await finalize_and_publish(gid, self._bot)
+            except Exception:
+                log.exception("retrying overdue draw %s failed", gid)
 
     def schedule(self, giveaway_id: int, end_at: datetime, draw_mode: str = "time") -> None:
         from bot.services import giveaway as gw_service

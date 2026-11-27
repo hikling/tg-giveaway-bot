@@ -424,6 +424,8 @@ async def pending_notifications(session: AsyncSession, giveaway_id: int) -> Sequ
         .join(Giveaway, Giveaway.id == WinnerLog.giveaway_id)
         .where(
             WinnerLog.giveaway_id == giveaway_id,
+            Giveaway.status == GiveawayStatus.finished,
+            Giveaway.publishing.is_(False),
             WinnerLog.replaced_at.is_(None),
             or_(WinnerLog.notified_at.is_(None), WinnerLog.notified_ok.is_(False)),
             or_(
@@ -446,6 +448,15 @@ async def replace_tier_winners(session: AsyncSession, giveaway_id: int, tier_nam
             WinnerLog.replaced_at.is_(None),
         )
         .values(replaced_at=_now())
+    )
+
+
+async def invalidate_undrawn_winners(session: AsyncSession, giveaway_id: int) -> None:
+    """Keep legacy premature rows for audit without giving them a valid claim interval."""
+    await session.execute(
+        update(WinnerLog)
+        .where(WinnerLog.giveaway_id == giveaway_id)
+        .values(replaced_at=WinnerLog.drawn_at)
     )
 
 

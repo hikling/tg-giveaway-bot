@@ -69,10 +69,10 @@ def parse_prizes(text: str) -> list[dict] | None:
         name, _, count_str = line.partition(sep)
         name = name.strip()
         count_str = count_str.strip()
-        if not name or not count_str.isdigit():
+        if not name or len(count_str) > 10 or not count_str.isdecimal():
             return None
         count = int(count_str)
-        if count <= 0:
+        if not 1 <= count <= 1_000_000_000:
             return None
         out.append({"name": name, "count": count})
     return out or None

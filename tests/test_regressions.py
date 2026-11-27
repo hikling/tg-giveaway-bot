@@ -31,6 +31,7 @@ from bot.prize_policy import CLAIM_WINDOW
 from bot.services import giveaway as gw_service
 from bot.services.channels import missing_channels, validate_channels
 from bot.services.notifier import retry_pending, winner_delivery_lock
+from bot.services.scheduler import GiveawayScheduler
 from bot.settings import Settings
 from bot.utils.esc import telegram_text_length
 
@@ -62,6 +63,26 @@ async def test_concurrent_draws_produce_one_result(sessionmaker, due_giveaway, b
     async with sessionmaker() as session:
         assert len(await list_winners(session, gid)) == 1
     assert len([m for m in bot.sent if m[0] == 1001]) == 1
+
+
+async def test_overdue_draw_scan_recovers_a_failed_one_off_draw(
+    sessionmaker, due_giveaway, bot, monkeypatch
+):
+    gid = await due_giveaway()
+    async with sessionmaker() as session:
+        await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
+        await session.commit()
+    with monkeypatch.context() as patch:
+        patch.setattr(gw_service, "log_winners", AsyncMock(side_effect=RuntimeError("disk failure")))
+        with pytest.raises(RuntimeError, match="disk failure"):
+            await gw_service.finalize_and_publish(gid, bot)
+    scheduler = GiveawayScheduler(bot)
+    await scheduler.finalize_overdue()
+    await scheduler.finalize_overdue()
+    async with sessionmaker() as session:
+        assert (await get_giveaway(session, gid)).status == GiveawayStatus.finished
+        assert [winner.user_id for winner in await list_winners(session, gid)] == [1001]
+    assert [chat for chat, _, _ in bot.sent] == [1001]
 
 
 async def test_large_draw_sends_one_public_summary_and_each_winner_a_dm(
@@ -264,9 +285,15 @@ async def test_retry_waits_for_initial_winner_dm(sessionmaker, due_giveaway, bot
         assert not await pending_notifications(session, gid)
 
 
-async def test_retry_ignores_legacy_winner_rows_before_draw(sessionmaker, new_giveaway, bot):
-    gid = await new_giveaway(prize_mode="unique")
+@pytest.mark.parametrize("publishing", [False, True])
+async def test_retry_ignores_legacy_winner_rows_before_draw(
+    sessionmaker, new_giveaway, bot, publishing
+):
+    gid = await new_giveaway(prize_mode="unique", publishing=publishing)
     async with sessionmaker() as session:
+        if publishing:
+            giveaway = await get_giveaway(session, gid)
+            giveaway.status = GiveawayStatus.finished
         await log_winners(session, gid, [(1001, "Steam card")])
         await session.commit()
 

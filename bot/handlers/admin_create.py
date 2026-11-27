@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -11,6 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from bot.callbacks.factories import PrizeDraftCb
+from bot.db.models import Giveaway, GiveawayStatus
 from bot.filters.admin import IsAdmin
 from bot.handlers.common import answer_notice, lang_of
 from bot.i18n import t
@@ -21,7 +23,7 @@ from bot.services.channels import (
     resolve_publication_targets,
     validate_channels,
 )
-from bot.services.publication import publish_all
+from bot.services.publication import publish_created
 from bot.services.scheduler import GiveawayScheduler
 from bot.settings import get_settings
 from bot.utils.esc import Raw, esc_list
@@ -125,7 +127,13 @@ def _inventory_summary(data: dict, lang: str) -> str:
 
 
 async def _reset_all_codes(message: Message, state: FSMContext, lang: str) -> None:
-    if (await state.get_data()).get("prize_mode") == "none":
+    data = await state.get_data()
+    if (request_id := data.get("request_id")) and (
+        await gw_service.get_creation(message.from_user.id, request_id)
+    ):
+        await message.answer(t("fsm.confirm_hint", lang))
+        return
+    if data.get("prize_mode") == "none":
         await message.answer(t("fsm.inventory_manual", lang))
         await _show_confirmation(message, state, lang)
         return
@@ -181,6 +189,59 @@ async def _accept_codes(message: Message, state: FSMContext, lang: str) -> None:
         codes_buffer=buffer, codes_pending=[], codes_index=index + 1, prize_review_token=None
     )
     await _ask_codes(message, state, lang)
+
+
+async def _save_draft(
+    message: Message, state: FSMContext, bot: Bot, lang: str, data: dict, request_id: str
+) -> Giveaway | None:
+    end_at = datetime.fromisoformat(data["end_at_iso"])
+    if data.get("draw_mode", "time") != "count" and end_at <= datetime.now(UTC):
+        await state.set_state(GiveawayDraft.waiting_duration)
+        await message.answer(t("fsm.bad_duration", lang))
+        return None
+
+    requirements = [*data["channels"], *data.get("groups", [])]
+    if not requirements:
+        await state.set_state(GiveawayDraft.waiting_channels)
+        await message.answer(t("fsm.no_destinations", lang))
+        return None
+    # 发布前重新检查权限并解析真实编号，相同目标的用户名/编号只发布一次。
+    try:
+        targets = await resolve_publication_targets(
+            bot, data["channels"], data.get("groups", [])
+        )
+    except ValueError as exc:
+        await message.answer(t("fsm.publish_check_failed", lang) + "\n" + esc_list([str(exc)]))
+        return None
+    except Exception:
+        await message.answer(t("fsm.publish_check_failed", lang))
+        return None
+    mode = str(data.get("prize_mode") or "none")
+    try:
+        gw = await gw_service.create(
+            creator_id=message.from_user.id,
+            title=data["title"],
+            description=data["description"],
+            prize_tiers=data["prizes"],
+            required_channels=data["channels"],
+            required_groups=data.get("groups", []),
+            draw_mode=data.get("draw_mode", "time"),
+            target_participants=data.get("target_participants"),
+            end_at=end_at,
+            turnstile_required=False,
+            prize_mode=mode,
+            publishing=True,
+            initial_codes=[
+                (str(name), list(codes)) for name, codes in data.get("codes_buffer", [])
+            ],
+            destinations=[(target.chat_id, target.name) for target in targets],
+            request_id=request_id,
+        )
+    except Exception as exc:
+        log.error("抽奖与奖品事务保存失败：%s", type(exc).__name__)
+        await message.answer(t("fsm.stock_save_failed", lang))
+        return None
+    return gw
 
 
 def build_admin_create_router() -> Router:
@@ -395,59 +456,28 @@ def build_admin_create_router() -> Router:
             return
 
         data = await state.get_data()
-        end_at = datetime.fromisoformat(data["end_at_iso"])
-        if data.get("draw_mode", "time") != "count" and end_at <= datetime.now(UTC):
-            await state.set_state(GiveawayDraft.waiting_duration)
-            await message.answer(t("fsm.bad_duration", lang))
-            return
+        request_id = data.get("request_id")
+        if not request_id:
+            request_id = str(uuid4())
+            await state.update_data(request_id=request_id)
+        gw = await gw_service.get_creation(message.from_user.id, request_id)
+        if gw is None:
+            gw = await _save_draft(message, state, bot, lang, data, request_id)
+            if gw is None:
+                return
 
-        requirements = [*data["channels"], *data.get("groups", [])]
-        if not requirements:
-            await state.set_state(GiveawayDraft.waiting_channels)
-            await message.answer(t("fsm.no_destinations", lang))
-            return
-        # 发布前重新检查权限并解析真实编号，相同目标的用户名/编号只发布一次。
         try:
-            targets = await resolve_publication_targets(
-                bot, data["channels"], data.get("groups", [])
-            )
-        except ValueError as exc:
-            await message.answer(t("fsm.publish_check_failed", lang) + "\n" + esc_list([str(exc)]))
-            return
-        except Exception:
-            await message.answer(t("fsm.publish_check_failed", lang))
-            return
-        mode = str(data.get("prize_mode") or "none")
-        try:
-            gw = await gw_service.create(
-                creator_id=message.from_user.id,
-                title=data["title"],
-                description=data["description"],
-                prize_tiers=data["prizes"],
-                required_channels=data["channels"],
-                required_groups=data.get("groups", []),
-                draw_mode=data.get("draw_mode", "time"),
-                target_participants=data.get("target_participants"),
-                end_at=end_at,
-                turnstile_required=False,
-                prize_mode=mode,
-                publishing=True,
-                initial_codes=[
-                    (str(name), list(codes)) for name, codes in data.get("codes_buffer", [])
-                ],
-                destinations=[(target.chat_id, target.name) for target in targets],
-            )
+            result = await publish_created(bot, gw)
         except Exception as exc:
-            log.error("抽奖与奖品事务保存失败：%s", type(exc).__name__)
-            await message.answer(t("fsm.stock_save_failed", lang))
+            log.error("抽奖 %s 发布未确认：%s", gw.id, type(exc).__name__)
+            await message.answer(t("fsm.publish_retry_saved", lang, id=gw.id))
             return
-
-        result = await publish_all(bot, gw.id)
+        if gw.status == GiveawayStatus.running and not result.canceled:
+            scheduler.schedule(gw.id, gw.end_at, gw.draw_mode)
+        await state.clear()
         if result.canceled:
             await message.answer(t("fsm.publish_all_failed", lang))
-            await state.clear()
             return
-        scheduler.schedule(gw.id, gw.end_at, gw.draw_mode)
         if result.failed:
             await message.answer(
                 t(
@@ -462,6 +492,5 @@ def build_admin_create_router() -> Router:
         # Admin controls stay in the admin chat on purpose: the public post
         # only carries the join button.
         await message.answer(t("fsm.saved", lang), reply_markup=admin_giveaway_panel(gw.id))
-        await state.clear()
 
     return router

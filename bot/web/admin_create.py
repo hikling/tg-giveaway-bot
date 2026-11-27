@@ -7,11 +7,9 @@ from typing import Annotated, Literal
 
 from aiohttp import web
 from pydantic import UUID4, BaseModel, ConfigDict, Field, StringConstraints
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from bot.db.base import get_sessionmaker
-from bot.db.models import Giveaway, GiveawayCreationRequest, GiveawayPost, GiveawayStatus
+from bot.db.models import Giveaway, GiveawayStatus
 from bot.prize_policy import CLAIM_WINDOW_HOURS
 from bot.services import giveaway
 from bot.services.channels import (
@@ -21,7 +19,7 @@ from bot.services.channels import (
     parse_requirements,
     resolve_publication_targets,
 )
-from bot.services.publication import publish_all
+from bot.services.publication import publish_created
 from bot.utils.esc import telegram_text_length
 from bot.utils.prize_input import parse_input
 from bot.utils.render import render
@@ -175,27 +173,13 @@ async def preview(request: web.Request) -> web.Response:
     )
 
 
-async def _existing(creator_id: int, request_id: str) -> Giveaway | None:
-    async with get_sessionmaker()() as session:
-        record = await session.get(GiveawayCreationRequest, (creator_id, request_id))
-        return await session.get(Giveaway, record.giveaway_id) if record else None
-
-
 async def _publish_result(request: web.Request, gw: Giveaway) -> web.Response:
-    if gw.publishing and gw.status == GiveawayStatus.running:
-        result = await publish_all(request.app["bot"], gw.id)
-        if not result.canceled:
-            request.app["scheduler"].schedule(gw.id, gw.end_at, gw.draw_mode)
-        sent, failed, canceled = result.sent, result.failed, result.canceled
-    else:
-        async with get_sessionmaker()() as session:
-            posts = (
-                await session.scalars(select(GiveawayPost).where(GiveawayPost.giveaway_id == gw.id))
-            ).all()
-        sent = sum(post.message_id is not None for post in posts)
-        failed = [post.label for post in posts if post.message_id is None]
-        canceled = gw.status == GiveawayStatus.canceled
-    return web.json_response({"id": gw.id, "sent": sent, "failed": failed, "canceled": canceled})
+    result = await publish_created(request.app["bot"], gw)
+    if gw.publishing and gw.status == GiveawayStatus.running and not result.canceled:
+        request.app["scheduler"].schedule(gw.id, gw.end_at, gw.draw_mode)
+    return web.json_response(
+        {"id": gw.id, "sent": result.sent, "failed": list(result.failed), "canceled": result.canceled}
+    )
 
 
 async def create(request: web.Request) -> web.Response:
@@ -203,7 +187,7 @@ async def create(request: web.Request) -> web.Response:
     creator_id, request_id = request["admin_id"], str(draft.request_id)
     # The app runs in a single process. The DB key makes retries survive restarts.
     async with request.app["admin_create_lock"]:
-        gw = await _existing(creator_id, request_id)
+        gw = await giveaway.get_creation(creator_id, request_id)
         if gw is None:
             prepared = await _prepare(request, draft)
             try:
@@ -227,7 +211,7 @@ async def create(request: web.Request) -> web.Response:
                     request_id=request_id,
                 )
             except IntegrityError:
-                gw = await _existing(creator_id, request_id)
+                gw = await giveaway.get_creation(creator_id, request_id)
                 if gw is None:
                     raise
         return await _publish_result(request, gw)

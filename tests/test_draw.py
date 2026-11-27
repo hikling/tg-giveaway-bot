@@ -327,9 +327,8 @@ async def test_reroll_never_rewards_the_same_person_twice(
     async with sessionmaker() as session:
         after = await current_winner_ids(session, gid)
         live = await list_winners(session, gid)
-    assert after <= before, "no new winner appears out of thin air"
-    assert [w.tier_name for w in live] == ["Silver"], "Gold has no live winner now"
-    assert after == {live[0].user_id}, "the untouched Silver winner is untouched"
+    assert after == before
+    assert [w.tier_name for w in live] == ["Gold", "Silver"]
 
 
 async def test_reroll_reports_a_shortfall_when_the_pool_is_tiny(

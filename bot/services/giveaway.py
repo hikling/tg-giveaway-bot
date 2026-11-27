@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayCreationRequest, GiveawayPost, GiveawayStatus
 from bot.db.prize_repo import add_codes as store_codes
-from bot.db.prize_repo import has_claim
+from bot.db.prize_repo import claimed_user_ids, has_claim
 from bot.db.repo import (
     GiveawayView,
     TierShortfall,
@@ -21,6 +21,7 @@ from bot.db.repo import (
     create_giveaway,
     current_winner_ids,
     get_giveaway,
+    invalidate_undrawn_winners,
     list_participants,
     list_winners,
     log_winners,
@@ -33,6 +34,12 @@ from bot.utils.prize_input import normalize_codes
 from bot.utils.rng import sample_winners
 
 log = logging.getLogger("bot.services.giveaway")
+
+
+async def get_creation(creator_id: int, request_id: str) -> Giveaway | None:
+    async with get_sessionmaker()() as session:
+        record = await session.get(GiveawayCreationRequest, (creator_id, request_id))
+        return await session.get(Giveaway, record.giveaway_id) if record else None
 
 
 async def create(
@@ -232,6 +239,7 @@ async def _reroll_tier(
         # Everyone already holding a live win, *including* the tier being
         # rerolled (its rows are about to be superseded).
         winners_elsewhere = await current_winner_ids(session, giveaway_id)
+        winners_elsewhere.update(await claimed_user_ids(session, giveaway_id))
         banned = await blacklist_ids(session, [p.user_id for p in participants])
         # A reroll must not replay the first draw, so the salt carries the round
         # number - and that number is published with the new winners.
@@ -248,6 +256,8 @@ async def _reroll_tier(
             salt_suffix=f"|r{round_no}",
         )
 
+        if not picked:
+            return [], shortfall
         await replace_tier_winners(session, giveaway_id, tier_name)
         picks = [(p.user_id, tier_name) for p in picked]
         await log_winners(session, giveaway_id, picks)
@@ -276,10 +286,12 @@ class DrawResult:
 
 async def _draw_locked(session: AsyncSession, gw: Giveaway) -> DrawResult:
     """调用方已取得抽奖写锁；开奖状态、名单和最后一次报名一起提交。"""
+    await invalidate_undrawn_winners(session, gw.id)
     gw.status = GiveawayStatus.finished
     participants = await list_participants(session, gw.id, verified_only=True)
     banned = await blacklist_ids(session, [p.user_id for p in participants])
     picks: list[tuple[int, str]] = []
+    already_awarded = await claimed_user_ids(session, gw.id)
     shortfalls: list[TierShortfall] = []
     for tier in gw.prize_tiers or []:
         name = str(tier.get("name", "")) or "?"
@@ -287,9 +299,10 @@ async def _draw_locked(session: AsyncSession, gw: Giveaway) -> DrawResult:
         if count <= 0:
             continue
         picked, shortfall = _pick_tier(
-            participants, name, count, {u for u, _ in picks}, banned, seed=gw.draw_seed
+            participants, name, count, already_awarded, banned, seed=gw.draw_seed
         )
         picks.extend((p.user_id, name) for p in picked)
+        already_awarded.update(p.user_id for p in picked)
         if shortfall is not None:
             shortfalls.append(shortfall)
     await log_winners(session, gw.id, picks)

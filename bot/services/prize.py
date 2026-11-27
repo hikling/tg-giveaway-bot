@@ -6,6 +6,7 @@ from typing import Any
 
 from bot.db import prize_repo
 from bot.db.base import get_sessionmaker
+from bot.db.models import GiveawayStatus
 from bot.db.prize_repo import CLAIM_OK, SHARED_CAP, ClaimOutcome, PrizeView, TierStock
 from bot.db.repo import claim_giveaway
 from bot.i18n import t
@@ -37,13 +38,24 @@ def max_claims_for(mode: str) -> int:
     return SHARED_CAP if mode == "shared" else 1
 
 
+class StockUnavailable(ValueError):
+    """The giveaway no longer accepts changes to this prize tier."""
+
+
 async def add_codes(
     giveaway_id: int, tier_name: str, codes: list[str], *, max_claims: int = 1
 ) -> int:
     sm = get_sessionmaker()
     async with sm() as session:
-        if await claim_giveaway(session, giveaway_id, None) is None:
-            return 0
+        giveaway = await claim_giveaway(session, giveaway_id, None)
+        if (
+            giveaway is None
+            or giveaway.status == GiveawayStatus.canceled
+            or giveaway.prize_mode not in SELF_SERVICE_MODES
+            or max_claims != max_claims_for(giveaway.prize_mode)
+            or not any(tier.get("name") == tier_name for tier in giveaway.prize_tiers or [])
+        ):
+            raise StockUnavailable
         added = await prize_repo.add_codes(
             session, giveaway_id, tier_name, codes, max_claims=max_claims
         )

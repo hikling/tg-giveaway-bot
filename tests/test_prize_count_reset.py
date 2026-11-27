@@ -15,7 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from sqlalchemy import func, select
 
 from bot.callbacks.factories import PrizeDraftCb
-from bot.db.models import Giveaway, PrizeCode
+from bot.db.models import Giveaway, GiveawayStatus, PrizeCode
 from bot.db.repo import add_admin
 from bot.handlers.admin_create import GiveawayDraft, build_admin_create_router
 from bot.handlers.prize import AddCodesDraft, build_prize_admin_router
@@ -264,6 +264,58 @@ async def test_replacement_codes_only_are_saved_and_publish_once(sessionmaker):
         assert await session.scalar(select(func.count()).select_from(Giveaway)) == 1
     assert len(bot.sent) == 1
     assert bot.sent[0][2].get("reply_markup") is not None
+
+
+async def test_confirm_retry_reuses_saved_giveaway_after_publish_receipt_fails(
+    sessionmaker, monkeypatch
+):
+    from bot.handlers import admin_create
+    from bot.services.publication import publish_created
+
+    state = await setup_creation()
+    await input_codes(state, "A\nB")
+    await input_codes(state, "确认奖品")
+    bot = PostingBot()
+    bot.set_member("@news", 777000, "administrator")
+    scheduler = SimpleNamespace(schedule=Mock())
+
+    async def lose_first_receipt(bot, giveaway):
+        await publish_created(bot, giveaway)
+        raise RuntimeError("publication reply lost")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(admin_create, "publish_created", lose_first_receipt)
+        first = Message("确认")
+        await handler("step_confirm")(first, state, bot, scheduler)
+    assert "同一场抽奖" in first.responses[-1][0]
+    await handler("step_confirm")(Message("确认"), state, bot, scheduler)
+
+    assert await state.get_state() is None
+    assert len(bot.sent) == 1
+    assert [p.code for p in await rows(sessionmaker)] == ["A", "B"]
+    async with sessionmaker() as session:
+        assert await session.scalar(select(func.count()).select_from(Giveaway)) == 1
+    scheduler.schedule.assert_called_once()
+
+
+async def test_prepared_topup_cannot_be_confirmed_after_cancellation(sessionmaker, new_giveaway):
+    gid = await new_giveaway(prize_mode="unique")
+    state = context()
+    await handler("on_addcodes", stock=True)(
+        Message("/addcodes"),
+        CommandObject(command="addcodes", args=f"{gid} Steam card"),
+        state,
+        Mock(),
+    )
+    await input_codes(state, "NOT-ADDED", stock=True)
+    async with sessionmaker() as session:
+        giveaway = await session.get(Giveaway, gid)
+        giveaway.status = GiveawayStatus.canceled
+        await session.commit()
+
+    result = await input_codes(state, "确认入库", stock=True)
+    assert "无法补充" in result.responses[-1][0]
+    assert await rows(sessionmaker) == []
 
 
 async def test_inventory_save_failure_rolls_back_entire_creation_and_keeps_draft(

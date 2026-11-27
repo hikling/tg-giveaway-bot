@@ -164,10 +164,11 @@ async def test_create_preview_retry_and_republish_use_same_giveaway(mini_app, se
     preview = await response.json()
     assert preview["tiers"] == [{"name": "一档", "count": 2, "inventory": 2}]
     post_preview = preview["post_preview"]
-    assert "<b>奖项</b>\n<blockquote>一档 × 2 个名额</blockquote>" in post_preview
-    assert "<b>领取方式</b>　一人一码" in post_preview
+    assert "<b>🏆 奖项</b>\n<blockquote>✦ 一档 × 2 个名额</blockquote>" in post_preview
+    assert "<b>📦 领取方式</b>　一人一码" in post_preview
     assert "48 小时" in post_preview and "自动回收" in post_preview
-    assert '\n\n<b>开奖</b>\n' in post_preview and '\n\n<b>报名</b>\n' in post_preview
+    assert "\n\n<b>🏁 开奖</b>\n" in post_preview
+    assert "\n\n<b>📝 报名步骤</b>\n" in post_preview
     assert '<a href="https://t.me/news">官方频道</a>' in post_preview
     assert set(preview["destinations"]) == {"官方频道", "交流群"}
     assert not bot.sent
@@ -454,7 +455,9 @@ async def test_locations_endpoint_single_or_multi_and_canceled_stock_guard(
         },
     )
     assert res.status == 200, await res.text()
-    assert (await res.json())["destinations"] == ["单群"]
+    single_group = await res.json()
+    assert single_group["destinations"] == ["单群"]
+    assert "必加频道" not in single_group["post_preview"]
 
     # Multiple channels and multiple groups
     orig_get_chat = bot.get_chat
@@ -480,7 +483,17 @@ async def test_locations_endpoint_single_or_multi_and_canceled_stock_guard(
         },
     )
     assert res.status == 200, await res.text()
-    assert set((await res.json())["destinations"]) == {"频道A", "频道B", "群A", "群B"}
+    multi_location = await res.json()
+    assert set(multi_location["destinations"]) == {"频道A", "频道B", "群A", "群B"}
+    assert (
+        '<b>📣 必加频道</b>\n'
+        '• <a href="https://t.me/news">频道A</a>\n'
+        '• <a href="https://t.me/ch2">频道B</a>\n\n'
+        '<b>👥 必加群组</b>\n'
+        '• <a href="https://t.me/+inv1">群A</a>\n'
+        '• <a href="https://t.me/+inv2">群B</a>\n\n'
+        '<b>📝 报名步骤</b>'
+    ) in multi_location["post_preview"]
 
     # Canceled giveaway cannot be restocked
     gid = await new_giveaway(prize_mode="unique")

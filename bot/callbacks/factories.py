@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from aiogram.filters.callback_data import CallbackData
 
+from bot.utils.ids import DatabaseId
+
 
 class JoinCb(CallbackData, prefix="join"):
-    giveaway_id: int
+    giveaway_id: DatabaseId
 
 
 class AdminGwCb(CallbackData, prefix="agw"):
     action: str
-    giveaway_id: int
+    giveaway_id: DatabaseId
 
 
 class ClaimCb(CallbackData, prefix="claim"):
@@ -19,18 +21,18 @@ class ClaimCb(CallbackData, prefix="claim"):
     and would blow past Telegram's 64-byte callback_data limit.
     """
 
-    giveaway_id: int
+    giveaway_id: DatabaseId
     tier_index: int
 
 
 class PoetryCb(CallbackData, prefix="poem"):
-    giveaway_id: int
+    giveaway_id: DatabaseId
     nonce: str
     choice: int
 
 
 class PrizeDraftCb(CallbackData, prefix="prizedraft"):
     scope: str
-    owner: int
+    owner: DatabaseId
     token: str
     action: str

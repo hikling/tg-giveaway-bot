@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from datetime import UTC, datetime
 from html import unescape
 
@@ -33,6 +32,7 @@ from bot.prize_policy import CLAIM_WINDOW_HOURS, SELF_SERVICE_MODES
 from bot.services import prize as prize_service
 from bot.services.scheduler import GiveawayScheduler
 from bot.utils.esc import telegram_text_length
+from bot.utils.ids import parse_id
 from bot.utils.prize_input import (
     ACCEPT_TEXTS,
     RESET_TEXTS,
@@ -97,7 +97,7 @@ async def _claim_one(
     if outcome.status == CLAIM_OK and outcome.code:
         try:
             await _send_prize_text(bot, user_id, t("prize.claimed", lang, code=outcome.code))
-        except TelegramAPIError:
+        except (TelegramAPIError, TimeoutError):
             # The committed claim remains available in the winner's private history.
             log.warning("奖品私信发送失败，抽奖 %s，用户 %s", giveaway_id, user_id)
             return _DELIVERY_FAILED
@@ -110,11 +110,9 @@ async def _claim_one(
     return outcome.status
 
 
-def _giveaway_id(args: str | None) -> int | None:
+def _giveaway_id(args: str | None, *, first: bool = False) -> int | None:
     text = (args or "").strip()
-    if not re.fullmatch(r"[1-9][0-9]{0,18}", text) or int(text) > 2**63 - 1:
-        return None
-    return int(text)
+    return parse_id(text.split(maxsplit=1)[0] if first and text else text)
 
 
 def _winner_result(giveaway: Giveaway, awards: dict[str, WinnerClaim]) -> str:
@@ -222,9 +220,8 @@ def build_prize_router() -> Router:
     ) -> None:
         uid = message.from_user.id
         lang = await lang_of(uid)
-        try:
-            gid = int((command.args or "").strip().split()[0])
-        except (ValueError, IndexError):
+        gid = _giveaway_id(command.args, first=True)
+        if gid is None:
             await answer_notice(message, t("prize.claim_usage", lang), scheduler)
             return
 
@@ -335,12 +332,17 @@ async def _accept_stock(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(t("prize.unknown" if gw is None else "prize.none_mode"))
         return
-    added = await prize_service.add_codes(
-        gid,
-        tier,
-        pending,
-        max_claims=prize_service.max_claims_for(gw.prize_mode),
-    )
+    try:
+        added = await prize_service.add_codes(
+            gid,
+            tier,
+            pending,
+            max_claims=prize_service.max_claims_for(gw.prize_mode),
+        )
+    except prize_service.StockUnavailable:
+        await state.clear()
+        await message.answer(t("prize.stock_unavailable"))
+        return
     await state.clear()
     text = t("prize.addcodes_ok", id=gid, tier=tier, count=added)
     if added < len(pending):
@@ -358,9 +360,8 @@ def build_prize_admin_router() -> Router:
         message: Message, command: CommandObject, scheduler: GiveawayScheduler
     ) -> None:
         lang = await lang_of(message.from_user.id)
-        try:
-            gid = int((command.args or "").strip().split()[0])
-        except (ValueError, IndexError):
+        gid = _giveaway_id(command.args, first=True)
+        if gid is None:
             await answer_notice(message, t("prize.status_usage", lang), scheduler)
             return
 
@@ -435,9 +436,8 @@ def build_prize_admin_router() -> Router:
         if len(parts) < 2:
             await message.answer(t("prize.addcodes_usage", lang))
             return
-        try:
-            gid = int(parts[0])
-        except ValueError:
+        gid = parse_id(parts[0])
+        if gid is None:
             await message.answer(t("prize.addcodes_usage", lang))
             return
         tier_name = parts[1].strip()

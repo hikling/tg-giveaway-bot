@@ -16,10 +16,11 @@ from bot.db import prize_repo
 from bot.db.base import get_engine, init_db
 from bot.db.models import Giveaway, GiveawayStatus, PrizeClaim, PrizeCode
 from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_EXPIRED, CLAIM_INELIGIBLE, CLAIM_OK
-from bot.db.repo import ban_user, log_winners, replace_tier_winners
+from bot.db.repo import add_participant, ban_user, list_winners, log_winners, replace_tier_winners
 from bot.handlers.prize import build_prize_admin_router, build_prize_router
 from bot.i18n import t
 from bot.prize_policy import CLAIM_WINDOW, CLAIM_WINDOW_HOURS
+from bot.services import giveaway as giveaway_service
 from bot.services import prize as prize_service
 from tests.conftest import ADMIN_ID
 
@@ -272,6 +273,63 @@ async def test_replaced_winner_and_wrong_tier_cannot_claim(sessionmaker, due_giv
     assert legitimate.status == CLAIM_OK and legitimate.code == "NEW-WINNER-ONLY"
 
 
+async def test_early_legacy_award_and_claim_stay_invalid_after_actual_draw(
+    sessionmaker, due_giveaway, bot
+):
+    gid = await due_giveaway(prize_mode="unique")
+    await prize_service.add_codes(gid, TIER, ["OLD-ISSUED", "ACTUAL-WINNER"])
+    async with sessionmaker() as session:
+        (early,) = await log_winners(session, gid, [(WINNER, TIER)])
+        code_id = await session.scalar(
+            select(PrizeCode.id).where(PrizeCode.giveaway_id == gid, PrizeCode.code == "OLD-ISSUED")
+        )
+        session.add(PrizeClaim(giveaway_id=gid, user_id=WINNER, tier_name=TIER, code_id=code_id))
+        await replace_tier_winners(session, gid, TIER)
+        await log_winners(session, gid, [(1003, TIER)])
+        await add_participant(session, giveaway_id=gid, user_id=OTHER_USER, username=None)
+        await session.commit()
+
+    await giveaway_service.finalize_and_publish(gid, bot)
+    async with sessionmaker() as session:
+        winners = await list_winners(session, gid)
+        assert [winner.user_id for winner in winners] == [OTHER_USER]
+        discarded = (await list_winners(session, gid, include_replaced=True))[0]
+        assert discarded.id == early.id
+        assert discarded.replaced_at == discarded.drawn_at
+    assert (await prize_service.claim(gid, WINNER, TIER)).status == CLAIM_INELIGIBLE
+    assert (await prize_service.claim(gid, 1003, TIER)).status == CLAIM_INELIGIBLE
+    assert await prize_service.claimed_by(WINNER) == []
+    assert (await prize_service.claim(gid, OTHER_USER, TIER)).code == "ACTUAL-WINNER"
+
+
+async def test_concurrent_command_and_buttons_award_once_even_with_legacy_extra_win(
+    sessionmaker, due_giveaway, bot
+):
+    gid = await due_giveaway(
+        prize_mode="unique",
+        prize_tiers=[{"name": TIER, "count": 1}, {"name": OTHER_TIER, "count": 1}],
+    )
+    await _record_winners(sessionmaker, gid, [(WINNER, TIER), (WINNER, OTHER_TIER)])
+    await prize_service.add_codes(gid, TIER, ["FIRST-PRIZE"])
+    await prize_service.add_codes(gid, OTHER_TIER, ["SECOND-PRIZE"])
+    command = CommandObject(prefix="/", command="claim", args=str(gid))
+    press = _handler("on_claim_button", event="callback_query")
+    await asyncio.gather(
+        _handler("on_claim_command")(_message(WINNER), command, bot, Mock()),
+        *(
+            press(
+                SimpleNamespace(from_user=SimpleNamespace(id=WINNER), answer=AsyncMock()),
+                ClaimCb(giveaway_id=gid, tier_index=index % 2),
+                bot,
+            )
+            for index in range(10)
+        ),
+    )
+    assert len(bot.sent) == 1 and bot.sent[0][0] == WINNER
+    assert len(await prize_service.claimed_by(WINNER)) == 1
+    assert sum(tier.remaining for tier in (await prize_service.stock(gid)).values()) == 1
+
+
 async def test_independent_topups_ignore_duplicates_across_batches_and_tiers(
     sessionmaker, new_giveaway
 ):
@@ -416,6 +474,10 @@ async def test_shared_text_update_delivers_latest_text(sessionmaker, due_giveawa
     cap = prize_service.max_claims_for("shared")
     await prize_service.add_codes(gid, TIER, ["OLD-SHARED"], max_claims=cap)
     assert (await prize_service.claim(gid, WINNER, TIER)).code == "OLD-SHARED"
+    async with sessionmaker() as session:
+        old = await session.scalar(select(PrizeCode).where(PrizeCode.giveaway_id == gid))
+        old.claimed_count = 0
+        await session.commit()
 
     await prize_service.add_codes(gid, TIER, ["NEW-SHARED"], max_claims=cap)
     second = await prize_service.claim(gid, OTHER_USER, TIER)
