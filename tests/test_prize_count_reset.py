@@ -262,7 +262,8 @@ async def test_replacement_codes_only_are_saved_and_publish_once(sessionmaker):
     assert [p.code for p in stock] == ["NEW-1", "NEW-2"]
     async with sessionmaker() as session:
         assert await session.scalar(select(func.count()).select_from(Giveaway)) == 1
-    assert len([text for _, text, _ in bot.sent if "🏆" in text]) == 1
+    assert len(bot.sent) == 1
+    assert bot.sent[0][2].get("reply_markup") is not None
 
 
 async def test_inventory_save_failure_rolls_back_entire_creation_and_keeps_draft(

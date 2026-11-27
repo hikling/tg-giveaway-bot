@@ -966,18 +966,41 @@ textarea { resize: vertical; }
     background: var(--tg-canvas);
     border: 1px solid var(--border);
     display: grid;
-    gap: 8px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
 }
 .tg-bubble {
-    padding: 14px 15px;
+    padding: 16px 15px;
     border-radius: 14px 14px 14px 4px;
     background: var(--tg-bubble);
     box-shadow: var(--shadow-sm);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
-    font-size: .92rem;
-    line-height: 1.5;
+    font-size: 1rem;
+    line-height: 1.65;
 }
+.tg-bubble > b:first-child {
+    font-size: 1.18em;
+    font-weight: 750;
+    line-height: 1.35;
+}
+.tg-bubble > i {
+    color: var(--muted);
+    font-size: .88em;
+    font-style: normal;
+}
+.tg-bubble > blockquote {
+    margin: 4px 0;
+    padding: 5px 10px;
+    border-inline-start: 2px solid var(--brand);
+    border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
+    background: var(--brand-soft);
+}
+.tg-bubble code {
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+}
+.tg-bubble > i:last-of-type + code { font-size: .75em; }
 .tg-bubble a { color: var(--brand-ink); }
 .tg-inline-btn {
     display: flex;

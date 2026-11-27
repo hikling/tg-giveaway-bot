@@ -1,43 +1,55 @@
 <b>🎁 {{ title }}</b>
-抽奖 #{{ id }}{{ " · 已开奖" if finished else "" }}
+<i>抽奖 #{{ id }}{{ " · 已开奖" if finished else "" }}</i>
 
 {% if description %}
 {{ description }}
 
 {% endif %}
-<b>🏆 奖项与领取</b>
-{% for tier in prizes %}
-• {{ tier.name }} · {{ tier.count }} 个名额
-{% endfor %}
+{% if prizes %}
+<b>奖项</b>
+<blockquote>
+{%- for tier in prizes -%}
+{{ tier.name }} × {{ tier.count }} 个名额{{ "\n" if not loop.last else "" }}
+{%- endfor -%}
+</blockquote>
+{% endif %}
 {% if prize_mode == "unique" %}
-领取方式：一人一码，中奖后到机器人私聊领取。
+<b>领取方式</b>　一人一码
+开奖后 {{ claim_hours }} 小时内私聊机器人领取
+逾期未领，奖品自动回收
 {% elif prize_mode == "shared" %}
-领取方式：共同领取，所有中奖者在私聊领取同一份内容。
+<b>领取方式</b>　共同领取
+中奖者私聊机器人领取同一份内容
+开奖后 {{ claim_hours }} 小时内领取，逾期自动回收
 {% else %}
-领取方式：中奖后由主办方联系发奖。
+<b>领取方式</b>　主办方联系发奖
+开奖后 {{ claim_hours }} 小时内联系主办方
 {% endif %}
-{{ claim_notice }}
 
-{% if not finished %}
-<b>📝 如何参加</b>
-{% if channels %}
-必加频道：{{ channels | join("、") }}
-{% endif %}
-{% if groups %}
-必加群组：{{ groups | join("、") }}
-{% endif %}
-加入上方所有地点后，私聊机器人发送 /start，再点「参加」完成古诗词答题。
-每题限时 60 秒，超时计错，每场最多可错 5 次。
-
-{% endif %}
-<b>🏁 开奖信息</b>
-开奖条件：{{ ends_at }}
+<b>开奖</b>
+{{ ends_at }}
 已报名：{{ count }} 人
 {% if finished %}
 私聊机器人发送 <code>/result {{ id }}</code> 查询中奖结果。
+{% else %}
+
+<b>报名</b>
+{% if channels %}
+必加频道　{{ channels | join("、") }}
+{% endif %}
+{% if groups %}
+必加群组　{{ groups | join("、") }}
+{% endif %}
+{% if channels or groups %}
+加入以上全部地点，私聊发 <code>/start</code>
+{% else %}
+私聊机器人发 <code>/start</code>
+{% endif %}
+点「参加」，答对古诗词即报名
+<i>60 秒/题，超时计错，每场最多错 5 次</i>
 {% endif %}
 {% if commit %}
 
-<b>🔐 开奖承诺</b>
+<i>开奖承诺</i>
 <code>{{ commit }}</code>
 {% endif %}

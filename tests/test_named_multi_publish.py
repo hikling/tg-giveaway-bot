@@ -253,7 +253,7 @@ async def test_lottery_deadline_during_publication_is_finalized_after_send(sessi
     class SlowBot(PostingBot):
         async def send_message(self, chat_id, text, **kwargs):
             result = await super().send_message(chat_id, text, **kwargs)
-            if "🏆" in text:
+            if kwargs.get("reply_markup") is not None:
                 async with base.get_sessionmaker()() as session:
                     game = await session.get(Giveaway, gw.id)
                     game.end_at = datetime.now(UTC) - timedelta(seconds=1)

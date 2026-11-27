@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayCreationRequest, GiveawayPost, GiveawayStatus
+from bot.prize_policy import CLAIM_WINDOW_HOURS
 from bot.services import giveaway
 from bot.services.channels import (
     Destination,
@@ -20,7 +21,6 @@ from bot.services.channels import (
     parse_requirements,
     resolve_publication_targets,
 )
-from bot.services.prize import claim_window_notice
 from bot.services.publication import publish_all
 from bot.utils.esc import telegram_text_length
 from bot.utils.prize_input import parse_input
@@ -122,7 +122,7 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
         description=draft.description,
         prizes=tiers,
         prize_mode=draft.prize_mode,
-        claim_notice=claim_window_notice(draft.prize_mode),
+        claim_hours=CLAIM_WINDOW_HOURS,
         channels=[linked_requirement(value) for value in channels],
         groups=[linked_requirement(value) for value in groups],
         ends_at=label,

@@ -163,9 +163,12 @@ async def test_create_preview_retry_and_republish_use_same_giveaway(mini_app, se
     assert response.status == 200, await response.text()
     preview = await response.json()
     assert preview["tiers"] == [{"name": "一档", "count": 2, "inventory": 2}]
-    assert "一人一码" in preview["post_preview"]
-    assert "48 小时" in preview["post_preview"] and "自动回收" in preview["post_preview"]
-    assert '<a href="https://t.me/news">官方频道</a>' in preview["post_preview"]
+    post_preview = preview["post_preview"]
+    assert "<b>奖项</b>\n<blockquote>一档 × 2 个名额</blockquote>" in post_preview
+    assert "<b>领取方式</b>　一人一码" in post_preview
+    assert "48 小时" in post_preview and "自动回收" in post_preview
+    assert '\n\n<b>开奖</b>\n' in post_preview and '\n\n<b>报名</b>\n' in post_preview
+    assert '<a href="https://t.me/news">官方频道</a>' in post_preview
     assert set(preview["destinations"]) == {"官方频道", "交流群"}
     assert not bot.sent
     async with sessionmaker() as session:
@@ -187,6 +190,9 @@ async def test_create_preview_retry_and_republish_use_same_giveaway(mini_app, se
         gw = await session.get(Giveaway, gid)
         assert gw.target_participants == 100
         assert preview["fixed_condition"] == gw.end_at.strftime("%Y-%m-%d %H:%M:%SZ") + "或满100人"
+        expected_post = post_preview.replace("抽奖 #预览</i>", f"抽奖 #{gid}</i>", 1)
+        expected_post = expected_post.replace(f"<code>{'0' * 64}</code>", f"<code>{gw.draw_commit}</code>", 1)
+        assert bot.sent[0][1] == expected_post
     scheduler.schedule.assert_called_once_with(gid, gw.end_at, "either")
 
     bot.fail_for.clear()

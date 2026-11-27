@@ -17,8 +17,8 @@ from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayPost, GiveawayStatus
 from bot.db.repo import claim_giveaway, count_participants
 from bot.keyboards.participate import participate_keyboard
+from bot.prize_policy import CLAIM_WINDOW_HOURS
 from bot.services.channels import linked_requirement
-from bot.services.prize import claim_window_notice
 from bot.settings import get_settings
 from bot.utils.render import render
 from bot.utils.timeparse import format_draw_condition
@@ -55,7 +55,7 @@ def render_running_post(gw: Giveaway, count: int) -> str:
         description=gw.description,
         prizes=gw.prize_tiers,
         prize_mode=gw.prize_mode,
-        claim_notice=claim_window_notice(gw.prize_mode),
+        claim_hours=CLAIM_WINDOW_HOURS,
         finished=gw.status == GiveawayStatus.finished,
         channels=[linked_requirement(x) for x in gw.required_channels or ()],
         groups=[linked_requirement(x) for x in gw.required_groups or ()],
