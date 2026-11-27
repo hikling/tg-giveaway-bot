@@ -12,7 +12,7 @@ const tzBadge = document.querySelector("#tz-badge");
 const confirmDialog = document.querySelector("#confirm-dialog");
 
 const statusLabels = {running: "进行中", finished: "已开奖", canceled: "已取消", all: "全部"};
-const modeLabels = {none: "主办方自行联系", unique: "独立码", shared: "共享文本"};
+const modeLabels = {none: "主办方自行联系", unique: "一人一码", shared: "共同领取"};
 const defaultTierNames = ["一等奖", "二等奖", "三等奖", "四等奖", "五等奖"];
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -878,7 +878,9 @@ function renderWinners(giveaway) {
             right.append(statusBadge("publishing", "待发送"));
         }
         if (giveaway.prize_mode !== "none") {
-            right.append(statusBadge(winner.claimed ? "good" : "info", winner.claimed ? "已领奖" : "未领奖"));
+            if (winner.claimed) right.append(statusBadge("good", "已领奖"));
+            else if (winner.claim_expired) right.append(statusBadge("warn", "已逾期回收"));
+            else right.append(statusBadge("info", "待领奖"));
         }
         row.append(left, right);
         list.append(row);
@@ -994,6 +996,8 @@ function renderStock(giveaway) {
             badge = statusBadge("info", "人工发奖");
         } else if (giveaway.prize_mode === "shared") {
             badge = tier.total ? statusBadge("good", "已录入") : statusBadge("warn", "待录入");
+        } else if (tier.recoverable || tier.withdrawn) {
+            badge = statusBadge("info", "有回收记录");
         } else if (tier.remaining === 0 && tier.total === 0) {
             badge = statusBadge("warn", "待补货");
         } else if (tier.remaining < Math.max(0, tier.count - tier.claimed)) {
@@ -1027,6 +1031,11 @@ function renderStock(giveaway) {
                 footer.append(restockBtn);
             }
             card.append(footer);
+            if (tier.recoverable || tier.withdrawn) {
+                card.append(element(
+                    "p", `已回收待取回 ${tier.recoverable} 条 · 已取回 ${tier.withdrawn} 条`, "hint",
+                ));
+            }
         } else if (giveaway.prize_mode === "shared") {
             const footer = element("div", undefined, "tier-footer");
             footer.append(
@@ -1049,6 +1058,12 @@ function renderStock(giveaway) {
         cards.append(card);
     }
     section.append(cards);
+    if (giveaway.can_withdraw_codes && giveaway.tiers.some(tier => tier.recoverable || tier.withdrawn)) {
+        const command = `/reclaim ${giveaway.id}`;
+        const hint = element("p", "在机器人私聊发送 ", "hint");
+        hint.append(element("code", command), " 取回回收的独立码。");
+        section.append(hint);
+    }
     if (!details) return section;
 
     details.append(element("summary", "补充库存", "button secondary"));
@@ -1204,21 +1219,42 @@ function renderCreate() {
         }
     }
 
-    function renderSavedPicks(container, items, control, labelText) {
+    function renderSavedPicks(container, items, kind, labelText) {
         container.replaceChildren();
         if (!items || !items.length) {
             container.hidden = true;
             return;
         }
         container.hidden = false;
-        container.append(element("span", labelText, "hint"));
+        const control = fields[kind];
+        const header = element("div", undefined, "saved-picks-header");
         const grid = element("div", undefined, "pick-grid");
+        const manage = element("button", "删除常用项", "button quiet compact");
+        manage.type = "button";
+        manage.setAttribute("aria-pressed", "false");
+        manage.addEventListener("click", () => {
+            const active = manage.getAttribute("aria-pressed") !== "true";
+            manage.setAttribute("aria-pressed", String(active));
+            manage.textContent = active ? "完成" : "删除常用项";
+            for (const control of grid.querySelectorAll(".saved-pick-remove, .saved-pick-reference")) {
+                control.hidden = !active;
+            }
+        });
+        header.append(element("span", labelText, "hint"), manage);
         for (const item of items) {
+            const row = element("div", undefined, "saved-pick-item");
             const pill = element("button", undefined, "pick-pill");
             pill.type = "button";
             pill.dataset.line = item.line;
             pill.setAttribute("aria-pressed", "false");
-            pill.append(svgIcon("check"), element("span", item.name + (item.private ? " (私有)" : "")));
+            const label = element("span", undefined, "saved-pick-label");
+            label.append(element("span", item.name + (item.private ? " (私有)" : "")));
+            if (item.name.toLowerCase() !== item.reference) {
+                const reference = element("small", item.reference, "saved-pick-reference");
+                reference.hidden = true;
+                label.append(reference);
+            }
+            pill.append(svgIcon("check"), label);
             pill.addEventListener("click", () => {
                 const lines = textareaLines(control);
                 const idx = lines.indexOf(item.line);
@@ -1229,9 +1265,27 @@ function renderCreate() {
                 markDirty();
                 syncCountersAndChips();
             });
-            grid.append(pill);
+            const remove = element("button", "删除", "button quiet compact danger-text saved-pick-remove");
+            remove.type = "button";
+            remove.hidden = true;
+            remove.setAttribute("aria-label", "删除常用项 " + item.name);
+            remove.addEventListener("click", async () => {
+                if (!await confirmAction(
+                    `删除「${item.name}」？`,
+                    `${item.reference} · 当前表单和已发布的抽奖会保留。`, "删除", true,
+                )) return;
+                await withButton(remove, "删除中…", async () => {
+                    await api("/locations/remove", {kind, reference: item.reference});
+                    row.remove();
+                    container.hidden = !grid.children.length;
+                    (container.hidden ? control : manage).focus();
+                    announce(`已从你的常用地点删除「${item.name}」。`);
+                });
+            });
+            row.append(pill, remove);
+            grid.append(row);
         }
-        container.append(grid);
+        container.append(header, grid);
         syncSavedPickStates();
     }
 
@@ -1378,14 +1432,11 @@ function renderCreate() {
 
             const codesField = tier.querySelector(".codes-field");
             codesField.hidden = mode === "none";
-            codesField.querySelector(".codes-label span").textContent =
-                mode === "unique" ? "独立码，每行一条" : "共享文本";
+            codesField.querySelector(".codes-label span").textContent = "独立码，每行一条";
 
             const cleanBtn = tier.querySelector(".clean-codes");
             const codesArea = tier.querySelector("[name=tier_codes]");
-            codesArea.placeholder = mode === "unique"
-                ? "粘贴卡密或兑换码，每行一条（自动去重和忽略空行）"
-                : "输入所有中奖者领取的同一份文本（保留换行）";
+            codesArea.placeholder = "粘贴卡密或兑换码，每行一条（自动去重和忽略空行）";
             cleanBtn.hidden = mode !== "unique" || !codesArea.value.trim();
 
             const tierName = tier.querySelector("[name=tier_name]").value.trim();
@@ -1439,15 +1490,6 @@ function renderCreate() {
                         badge.textContent = `${count} 条`;
                     }
                 }
-            } else if (mode === "shared") {
-                const hasText = Boolean(raw && raw !== "-");
-                if (hasText) totalStock += 1;
-                inventory = hasText ? "已录入 1 份共享文本" : "尚未录入共享文本";
-                if (badge.hidden) {
-                    badge.hidden = false;
-                    badge.className = hasText ? "status good inventory-badge" : "status warn inventory-badge";
-                    badge.textContent = hasText ? "已录入" : "待录入";
-                }
             }
             inventoryNode.textContent = inventory;
         }
@@ -1455,8 +1497,7 @@ function renderCreate() {
         if (mode === "none") {
             prizeSummaryPill.textContent = `共 ${tiers.length} 档 · ${totalSeats} 个中奖名额`;
         } else {
-            const unit = mode === "shared" ? "份共享文本" : "条独立码";
-            prizeSummaryPill.textContent = `共 ${tiers.length} 档 · ${totalSeats} 名额 · 已录 ${totalStock} ${unit}`;
+            prizeSummaryPill.textContent = `共 ${tiers.length} 档 · ${totalSeats} 名额 · 已录 ${totalStock} 条独立码`;
         }
     }
 
@@ -1579,8 +1620,8 @@ function renderCreate() {
     api("/locations")
         .then(data => {
             if (!form.isConnected) return;
-            renderSavedPicks(channelsSaved, data.channels, fields.channels, "常用频道（可单选或多选）：");
-            renderSavedPicks(groupsSaved, data.groups, fields.groups, "常用群组（可单选或多选）：");
+            renderSavedPicks(channelsSaved, data.channels, "channels", "常用频道");
+            renderSavedPicks(groupsSaved, data.groups, "groups", "常用群组");
         })
         .catch(() => {});
 }
@@ -1591,37 +1632,8 @@ function showPreview(draft, preview, returnToForm) {
     const mockup = element("section", undefined, "tg-mockup");
     mockup.append(element("span", "Telegram 频道/群组帖子预览", "hint"));
     const bubble = element("div", undefined, "tg-bubble");
-    bubble.append(element("div", "🎁 抽奖 #预览", "hint"));
-    bubble.append(element("div", request.title, "tg-bubble-title"));
-    if (request.description.trim()) {
-        bubble.append(element("div", request.description.trim(), "prewrap"));
-    }
-
-    const prizeSec = element("div", undefined, "tg-bubble-section");
-    prizeSec.append(element("strong", "🏆 奖品："));
-    for (const tier of preview.tiers) {
-        prizeSec.append(element("span", `• ${tier.name} × ${tier.count}`));
-    }
-    bubble.append(prizeSec);
-
-    if (preview.channels?.length) {
-        const chSec = element("div", undefined, "tg-bubble-section");
-        chSec.append(element("strong", "📢 必加频道："));
-        for (const ch of preview.channels) chSec.append(element("span", "• " + ch));
-        bubble.append(chSec);
-    }
-    if (preview.groups?.length) {
-        const gpSec = element("div", undefined, "tg-bubble-section");
-        gpSec.append(element("strong", "👥 必加群组："));
-        for (const gp of preview.groups) gpSec.append(element("span", "• " + gp));
-        bubble.append(gpSec);
-    }
-
-    bubble.append(
-        element("span", "📝 参加须答对古诗词选择题，每题限时 60 秒，最多错 5 次。", "hint"),
-        element("span", "🏁 开奖条件：" + preview.condition),
-        element("span", "👥 已报名：0 人"),
-    );
+    // The server renders the same autoescaped template used for Telegram posts.
+    bubble.innerHTML = preview.post_preview.trim();
 
     const fakeJoin = element("div", "✅ 参加", "tg-inline-btn");
     mockup.append(bubble, fakeJoin);
@@ -1643,8 +1655,6 @@ function showPreview(draft, preview, returnToForm) {
         let badge;
         if (mode === "none") {
             badge = statusBadge("info", "人工发奖");
-        } else if (mode === "shared") {
-            badge = tier.inventory ? statusBadge("good", "已录入共享文本") : statusBadge("warn", "待补充文本");
         } else if (tier.inventory === tier.count) {
             badge = statusBadge("good", `已录 ${tier.inventory} 条`);
         } else if (tier.inventory < tier.count) {
@@ -1657,10 +1667,7 @@ function showPreview(draft, preview, returnToForm) {
     }
 
     const list = panel("奖项与发奖方式", element("p", "发奖方式：" + modeLabels[request.prize_mode], "hint"), tierLines);
-    if (preview.tiers.some(tier =>
-        (request.prize_mode === "unique" && tier.inventory !== tier.count)
-        || (request.prize_mode === "shared" && !tier.inventory),
-    )) {
+    if (request.prize_mode === "unique" && preview.tiers.some(tier => tier.inventory !== tier.count)) {
         list.append(element("p", "部分奖项的奖品库存与中奖名额不一致，发布后仍可随时补货。", "inventory-warning"));
     }
 

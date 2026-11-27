@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import get_sessionmaker
 from bot.db.models import Giveaway, GiveawayCreationRequest, GiveawayPost, GiveawayStatus
-from bot.db.prize_repo import SHARED_CAP, has_claim
 from bot.db.prize_repo import add_codes as store_codes
+from bot.db.prize_repo import has_claim
 from bot.db.repo import (
     GiveawayView,
     TierShortfall,
@@ -53,8 +53,10 @@ async def create(
     initial_codes: list[tuple[str, list[str]]] | None = None,
     request_id: str | None = None,
 ) -> Giveaway:
+    if prize_mode not in {"none", "unique"}:
+        raise ValueError("新抽奖仅支持一人一码或由主办方联系发奖。")
     # Commit before the giveaway exists in public: the hash ships in the post,
-    # the seed is only revealed with the winners, so the draw can be replayed.
+    # the seed is only revealed after the draw, so the draw can be replayed.
     if draw_mode not in {"time", "count", "either"}:
         raise ValueError("无效的开奖方式")
     if draw_mode != "time" and (
@@ -89,7 +91,7 @@ async def create(
                 gw.id,
                 tier_name,
                 codes,
-                max_claims=SHARED_CAP if prize_mode == "shared" else 1,
+                max_claims=1,
             )
             if prize_mode == "unique" and added < len(normalize_codes(codes)):
                 raise ValueError("同一场抽奖的多个奖项不能录入同一个独立码。")

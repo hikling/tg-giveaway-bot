@@ -73,7 +73,7 @@ async def test_group_commands_do_not_open_a_prize_draft(sessionmaker):
     ]
 
 
-async def setup_creation(*, mode="unique", tiers=None):
+async def setup_creation(*, tiers=None):
     state = context()
     await state.set_state(GiveawayDraft.waiting_prizemode)
     await state.update_data(
@@ -84,7 +84,7 @@ async def setup_creation(*, mode="unique", tiers=None):
         groups=[],
         end_at_iso=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
     )
-    await handler("step_prizemode")(Message("1" if mode == "unique" else "2"), state)
+    await handler("step_prizemode")(Message("1"), state)
     return state
 
 
@@ -184,7 +184,7 @@ async def test_reset_is_available_on_final_confirmation_and_keeps_owner(sessionm
     first = await input_codes(state, "OLD-1\nOLD-2")
     cq = await click(state, button(first, "accept"))
     final = cq.message
-    assert "已录入 2 份" in final.responses[-1][0]
+    assert "已录入 2 条" in final.responses[-1][0]
     reset = button(final, "reset")
     assert reset.owner == ADMIN
     await click(state, reset)
@@ -202,15 +202,6 @@ async def test_reset_text_on_final_confirmation_does_not_publish(sessionmaker):
     bot.get_chat.assert_not_awaited()
     assert (await state.get_data())["codes_buffer"] == []
     assert await state.get_state() == GiveawayDraft.waiting_codes.state
-
-
-async def test_shared_multiline_counts_as_one_and_replaces_previous_content(sessionmaker):
-    state = await setup_creation(mode="shared")
-    message = await input_codes(state, "第一行\n第二行")
-    assert "已识别：1 份共享文本" in message.responses[-1][0]
-    await input_codes(state, "新的共享内容\n新第二行")
-    await input_codes(state, "确认奖品")
-    assert (await state.get_data())["codes_buffer"] == [["一等奖", ["新的共享内容\n新第二行"]]]
 
 
 async def test_duplicate_accept_does_not_skip_next_tier(sessionmaker, admin):

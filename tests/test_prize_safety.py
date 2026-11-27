@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -11,12 +12,16 @@ from aiogram.types import BufferedInputFile
 from sqlalchemy import select
 
 from bot.callbacks.factories import ClaimCb
+from bot.db import prize_repo
+from bot.db.base import get_engine, init_db
 from bot.db.models import Giveaway, GiveawayStatus, PrizeClaim, PrizeCode
-from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_INELIGIBLE, CLAIM_OK
+from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_EXPIRED, CLAIM_INELIGIBLE, CLAIM_OK
 from bot.db.repo import ban_user, log_winners, replace_tier_winners
-from bot.handlers.prize import build_prize_router
+from bot.handlers.prize import build_prize_admin_router, build_prize_router
 from bot.i18n import t
+from bot.prize_policy import CLAIM_WINDOW, CLAIM_WINDOW_HOURS
 from bot.services import prize as prize_service
+from tests.conftest import ADMIN_ID
 
 WINNER = 1001
 OTHER_USER = 1002
@@ -43,12 +48,139 @@ def _message(uid, *, group=False):
     )
 
 
-async def _record_winners(sessionmaker, gid, winners, *, status=GiveawayStatus.finished):
+async def _record_winners(
+    sessionmaker, gid, winners, *, status=GiveawayStatus.finished, drawn_at=None
+):
     async with sessionmaker() as session:
         gw = await session.get(Giveaway, gid)
         gw.status = status
-        await log_winners(session, gid, winners)
+        rows = await log_winners(session, gid, winners)
+        if drawn_at is not None:
+            for row in rows:
+                row.drawn_at = drawn_at
         await session.commit()
+
+
+@pytest.mark.parametrize("mode", ["unique", "shared"])
+async def test_claim_expires_at_48_hours_and_keeps_claim_history(
+    sessionmaker, new_giveaway, monkeypatch, mode
+):
+    gid = await new_giveaway(prize_mode=mode)
+    drawn_at = datetime.now(UTC) - CLAIM_WINDOW
+    await _record_winners(sessionmaker, gid, [(WINNER, TIER), (OTHER_USER, TIER)], drawn_at=drawn_at)
+    now = drawn_at + CLAIM_WINDOW - timedelta(microseconds=1)
+    monkeypatch.setattr(prize_repo, "datetime", SimpleNamespace(now=lambda _tz: now))
+    await prize_service.add_codes(
+        gid, TIER, ["for-first-winner", "spare"] if mode == "unique" else ["shared-content"],
+        max_claims=prize_service.max_claims_for(mode),
+    )
+
+    received = await prize_service.claim(gid, WINNER, TIER)
+    assert received.status == CLAIM_OK
+    now += timedelta(microseconds=1)
+    assert (await prize_service.claim(gid, OTHER_USER, TIER)).status == CLAIM_EXPIRED
+    assert (await prize_service.claim(gid, WINNER, TIER)).status == CLAIM_ALREADY
+    assert [prize.code for prize in await prize_service.claimed_by(WINNER)] == [received.code]
+    assert await prize_service.claimed_by(OTHER_USER) == []
+
+
+async def test_expired_claim_entrypoints_and_organizer_recovery(
+    bot, sessionmaker, new_giveaway, monkeypatch
+):
+    gid = await new_giveaway(prize_mode="unique")
+    drawn_at = datetime.now(UTC) - CLAIM_WINDOW - timedelta(minutes=1)
+    await _record_winners(sessionmaker, gid, [(WINNER, TIER), (OTHER_USER, TIER)], drawn_at=drawn_at)
+    await prize_service.add_codes(gid, TIER, ["issued-code", "recovered-code"])
+    async with sessionmaker() as session:
+        # A legacy duplicate must never appear twice in the recovered file.
+        session.add(PrizeCode(giveaway_id=gid, tier_name=TIER, code="recovered-code"))
+        await session.commit()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            prize_repo, "datetime",
+            SimpleNamespace(now=lambda _tz: drawn_at + timedelta(hours=1)),
+        )
+        assert (await prize_service.claim(gid, WINNER, TIER)).code == "issued-code"
+        assert await prize_service.withdraw_recovered_codes(gid, ADMIN_ID) == []
+
+    scheduler = Mock()
+    callback = SimpleNamespace(from_user=SimpleNamespace(id=OTHER_USER), answer=AsyncMock())
+    await _handler("on_claim_button", event="callback_query")(
+        callback, ClaimCb(giveaway_id=gid, tier_index=0), bot
+    )
+    expired = t("prize.expired", hours=CLAIM_WINDOW_HOURS)
+    callback.answer.assert_awaited_once_with(expired, show_alert=True)
+
+    claimant = _message(OTHER_USER)
+    await _handler("on_claim_command")(
+        claimant, CommandObject(prefix="/", command="claim", args=str(gid)), bot, scheduler
+    )
+    claimant.answer.assert_awaited_once_with(expired)
+    result = _message(OTHER_USER)
+    await _handler("on_result")(
+        result, CommandObject(prefix="/", command="result", args=str(gid)), scheduler
+    )
+    assert "逾期已回收" in result.answer.await_args.args[0]
+    assert f"/claim {gid}" not in result.answer.await_args.args[0]
+    assert not bot.sent
+
+    stock = (await prize_service.stock(gid))[TIER]
+    assert (stock.claimed, stock.recoverable, stock.withdrawn) == (1, 1, 0)
+    admin_router = build_prize_admin_router()
+    withdraw = next(
+        h.callback for h in admin_router.message.handlers if h.callback.__name__ == "on_reclaim"
+    )
+    command = CommandObject(prefix="/", command="reclaim", args=str(gid))
+    bot.send_document = AsyncMock()
+    await withdraw(_message(ADMIN_ID, group=True), command, bot, scheduler)
+    await withdraw(_message(OTHER_USER), command, bot, scheduler)
+    bot.send_document.assert_not_awaited()
+
+    host = _message(ADMIN_ID)
+    bot.send_document.side_effect = [TimeoutError(), None]
+    await withdraw(host, command, bot, scheduler)
+    host.answer.assert_awaited_once_with(t("prize.reclaim_retry", id=gid))
+    engine = get_engine()
+    await engine.dispose()
+    await init_db(engine.url.render_as_string())
+    assert (await prize_service.claim(gid, OTHER_USER, TIER)).status == CLAIM_EXPIRED
+    await withdraw(host, command, bot, scheduler)
+    assert bot.send_document.await_count == 2
+    for delivery in bot.send_document.await_args_list:
+        assert delivery.args[0] == ADMIN_ID
+        assert delivery.args[1].data == b"recovered-code\n"
+    stock = (await prize_service.stock(gid))[TIER]
+    assert (stock.claimed, stock.remaining, stock.recoverable, stock.withdrawn) == (1, 0, 0, 1)
+    assert [prize.code for prize in await prize_service.claimed_by(WINNER)] == ["issued-code"]
+
+
+async def test_result_shows_only_the_callers_current_win(sessionmaker, new_giveaway):
+    gid = await new_giveaway(prize_mode="unique")
+    result = _handler("on_result")
+    command = CommandObject(prefix="/", command="result", args=str(gid))
+    scheduler = Mock()
+    pending = _message(WINNER)
+    await result(pending, command, scheduler)
+    assert "尚未开奖" in pending.answer.await_args.args[0]
+
+    await _record_winners(sessionmaker, gid, [(OTHER_USER, TIER)])
+    async with sessionmaker() as session:
+        await replace_tier_winners(session, gid, TIER)
+        await log_winners(session, gid, [(WINNER, TIER)])
+        await session.commit()
+    old_winner = _message(OTHER_USER)
+    await result(old_winner, command, scheduler)
+    assert "未查询到" in old_winner.answer.await_args.args[0]
+
+    current_winner = _message(WINNER)
+    await result(current_winner, command, scheduler)
+    body = current_winner.answer.await_args.args[0]
+    assert TIER in body and f"/claim {gid}" in body
+
+    group = _message(WINNER, group=True)
+    await result(group, command, scheduler)
+    group.answer.assert_awaited_once_with(t("common.in_private_only"))
 
 
 async def test_prize_history_stays_in_the_winners_private_chat(bot, sessionmaker, due_giveaway):

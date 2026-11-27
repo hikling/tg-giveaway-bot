@@ -18,6 +18,7 @@ from bot.db.models import (
     User,
     WinnerLog,
 )
+from bot.prize_policy import CLAIM_WINDOW, SELF_SERVICE_MODES
 
 
 def _now() -> datetime:
@@ -373,8 +374,10 @@ async def log_winners(
     giveaway_id: int,
     winners: list[tuple[int, str]],
 ) -> list[WinnerLog]:
+    drawn_at = _now()
     rows = [
-        WinnerLog(giveaway_id=giveaway_id, user_id=uid, tier_name=tier) for uid, tier in winners
+        WinnerLog(giveaway_id=giveaway_id, user_id=uid, tier_name=tier, drawn_at=drawn_at)
+        for uid, tier in winners
     ]
     session.add_all(rows)
     await session.flush()
@@ -415,13 +418,21 @@ async def mark_winner_notified(
 
 
 async def pending_notifications(session: AsyncSession, giveaway_id: int) -> Sequence[WinnerLog]:
-    """Current winners whose DM has not been confirmed delivered."""
-    stmt = select(WinnerLog).where(
-        WinnerLog.giveaway_id == giveaway_id,
-        WinnerLog.replaced_at.is_(None),
-        or_(WinnerLog.notified_at.is_(None), WinnerLog.notified_ok.is_(False)),
+    """Current winners still eligible to receive a pending winner DM."""
+    stmt = (
+        select(WinnerLog)
+        .join(Giveaway, Giveaway.id == WinnerLog.giveaway_id)
+        .where(
+            WinnerLog.giveaway_id == giveaway_id,
+            WinnerLog.replaced_at.is_(None),
+            or_(WinnerLog.notified_at.is_(None), WinnerLog.notified_ok.is_(False)),
+            or_(
+                Giveaway.prize_mode.not_in(SELF_SERVICE_MODES),
+                WinnerLog.drawn_at > _now() - CLAIM_WINDOW,
+            ),
+        )
+        .order_by(WinnerLog.id)
     )
-    stmt = stmt.order_by(WinnerLog.id)
     return (await session.execute(stmt)).scalars().all()
 
 

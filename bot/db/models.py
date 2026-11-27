@@ -153,6 +153,7 @@ class PrizeCode(Base):
     code: Mapped[str] = mapped_column(Text)
     max_claims: Mapped[int] = mapped_column(Integer, default=1)
     claimed_count: Mapped[int] = mapped_column(Integer, default=0)
+    withdrawn_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_utcnow)
 
 
@@ -238,3 +239,13 @@ class GiveawayCreationRequest(Base):
     creator_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     giveaway_id: Mapped[int] = mapped_column(ForeignKey("giveaways.id", ondelete="CASCADE"))
+
+
+class HiddenLocation(Base):
+    """常用地点来自发布历史，按管理员记录已删除的建议。"""
+
+    __tablename__ = "hidden_locations"
+
+    admin_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8), primary_key=True)
+    reference: Mapped[str] = mapped_column(String(33), primary_key=True)

@@ -14,6 +14,8 @@ start:
 
     • /me — 我参与的抽奖
 
+    • /result 〈抽奖编号〉 — 私聊查询中奖结果
+
 
     管理员命令 (仅管理员)
 
@@ -26,6 +28,8 @@ start:
     • /reroll 〈抽奖编号〉 〈奖项名〉 — 重抽已结束的奖项
 
     • /retry 〈抽奖编号〉 — 重试未送达的中奖私信
+
+    • /reclaim 〈抽奖编号〉 — 主办方私聊取回逾期回收的独立码
 
     • /ban 〈用户编号〉 [原因] — 拉黑用户(同时清除其报名记录)
 
@@ -70,14 +74,13 @@ join:
   publishing: 抽奖正在发布，请稍后重新点击参加。
 giveaway:
   running_header: '🎁 抽奖 #{id} — 进行中'
-  finished_header: '🏁 抽奖 #{id} — 已结束'
-  reroll_header: '🎲 抽奖 #{id} — 奖项已重抽'
+  finished_header: '<b>🏁 抽奖 #{id} 已开奖</b>'
+  reroll_header: '<b>🎲 抽奖 #{id} 已完成重抽</b>'
+  result_title: '<b>{title}</b>'
+  result_count: '本轮中奖人数：{count} 人'
+  result_shortfall: '符合条件的人数不足，空缺 {missing} 个名额。'
+  result_check: '中奖通知由机器人私聊发送。也可私聊机器人发送 <code>/result {id}</code> 查询。'
   canceled: '❌ 抽奖 #{id} 已取消。'
-  no_participants: 无人参与,本次抽奖作废。
-  no_winners: 本次开奖没有符合条件的中奖者。
-  winners_header: '中奖名单:'
-  winner_line: '• {tier}: {mention}'
-  tier_short: "⚠️ {tier}:应发 {requested} 份,实际只发出 {granted} 份\n   (缺 {missing} 份),符合资格的参与者不足。\n"
   count_label: 已参与 {count} 人
   ends_label: 结束时间:{ends_at}
   prizes_label: '奖品:
@@ -92,6 +95,15 @@ giveaway:
     参与者快照：{digest}
 
     复算方式见项目说明「可验证开奖」。'
+result:
+  usage: '请发送 <code>/result 抽奖编号</code>，例如 <code>/result 8</code>。'
+  pending: '抽奖 #{id}「{title}」尚未开奖。'
+  won: '🎉 你在抽奖 #{id}「{title}」中获得了：{tiers}。'
+  not_won: '抽奖 #{id}「{title}」已开奖，本场未查询到你的中奖记录。'
+  host: 主办方会联系你发奖。
+  claim: '发送 <code>/claim {id}</code> 领取。'
+  expired: '逾期已回收：{tiers}。'
+  already: '已领取：{tiers}。发送 /myprizes 查看。'
 winner_dm:
   body: '🎉 恭喜!你在 "{title}" 中中奖了。
 
@@ -104,11 +116,15 @@ winner_dm:
 
     奖项:{tier}
 
-    点下面的「🎁 领取奖品」按钮就能拿到奖品,也可以发送 /claim 或 /myprizes。
+    点击「🎁 领取奖品」，或私聊发送 <code>/claim {id}</code> 领取。
 
     '
   host: 主办方(ID:{id})
 prize:
+  claim_window: '⏳ 请在本轮开奖后 {hours} 小时内领取，逾期未领的奖品将自动回收。'
+  manual_window: '⏳ 请在本轮开奖后 {hours} 小时内联系主办方领取。'
+  claim_deadline: '领奖截止：{deadline}（{tz}）。'
+  expired: '这份奖品已超过 {hours} 小时领取期限，已自动回收。'
   claimed: '🎁 你的奖品:
 
 
@@ -142,6 +158,13 @@ prize:
   stock_header: '📦 抽奖 #{id} 的奖池:'
   stock_row: • {tier}:共 {total} / 已领 {claimed} / 剩余 {remaining}
   stock_empty: '抽奖 #{id} 还没有录入任何奖品。'
+  recovery_stock: '已回收待取回 {recoverable} 条 · 已取回 {withdrawn} 条'
+  reclaim_hint: '主办方可私聊发送 <code>/reclaim {id}</code> 下载回收的独立码。'
+  reclaim_usage: '请发送 <code>/reclaim 抽奖编号</code>，例如 <code>/reclaim 8</code>。'
+  reclaim_unavailable: '请由该场已开奖抽奖的主办方取回独立码。'
+  reclaim_empty: '抽奖 #{id} 暂无已回收的独立码可取回。'
+  reclaim_caption: '抽奖 #{id} 的回收独立码，共 {count} 条。'
+  reclaim_retry: '文件发送失败。请再次私聊发送 <code>/reclaim {id}</code> 下载。'
   status_usage: 用法:/prizestatus 〈抽奖编号〉
   addcodes_usage: 用法:/addcodes 〈抽奖编号〉 〈奖项名〉
   addcodes_prompt: '请把「{tier}」本次要补充的奖品发来，系统会先统计数量供你核对，确认后才会入库。
@@ -241,18 +264,15 @@ fsm:
   bad_duration: 请填写未来的时间（如30m或2026-12-01 20:00）、满100人，或6h或满100人（任一先到）。人数必须为正整数。
   enter_prizemode: '奖品怎么发?(7/8)
 
-    1 = 每人一条独立码,2 = 所有人同一段文本,0 = 不自动发(自己联系中奖者)
+    1 = 一人一码，0 = 由主办方联系发奖
 
     '
-  bad_prizemode: 请回答 1(独立码)、2(共享文本)或 0(不自动发)。
+  bad_prizemode: 请回答 1（一人一码）或 0（由主办方联系发奖）。
   enter_codes_unique: '请录入「{tier}」的奖品（8/8），一行一条，计划 {count} 名中奖者。
 
     自动忽略空行、去除本档重复内容。可分多条消息粘贴，系统累计统计，核对后点「确认本档奖品」。
 
     发送 - 可跳过本档，之后可用 /addcodes 补货。'
-  enter_codes_shared: '请录入「{tier}」的一份共享文本（8/8），整段（含换行）算一份，所有中奖者领取同一内容。
-
-    发送新消息会替换本档尚未确认的共享文本。核对后点「确认本档奖品」，发送 - 可跳过。'
   bad_codes: 没有收到可用的奖品内容,请一行一条粘贴,或发送 - 跳过。
   codes_short: '⚠️ 只收到 {count} 条,少于中奖名额 {needed} 条。
 
@@ -260,7 +280,6 @@ fsm:
 
     '
   mode_unique: 每人一条独立码
-  mode_shared: 所有人共享同一段文本
   mode_none: 不自动发(主办方自行联系)
   confirm: '请确认：
 
@@ -325,18 +344,9 @@ fsm:
     数量正确请点「确认本档奖品」；还可继续粘贴，累计去重统计。
 
     数量不对可点「全部删除并重新添加」，清空所有档位的草稿奖品后重录。'
-  codes_review_shared: '📦「{tier}」共享奖品核对
-
-    已识别：{count} 份共享文本，供本档 {needed} 名中奖者领取。
-
-    本场当前共录入 {total} 份文本，不按文本行数计算。
-
-    正确请点「确认本档奖品」；重新发送文本会替换本档内容。
-
-    也可点「全部删除并重新添加」，从第一档重新录入。'
   codes_reset: 已全部清空本场草稿中的奖品内容，将从第一个奖项重新录入。抽奖设置和计划中奖人数已保留。
-  inventory_total: 已识别奖品内容合计：{count} 份（共享模式按文本份数统计）
-  inventory_row: • {tier}：已录入 {count} 份，计划 {needed} 名中奖者
+  inventory_total: 已识别奖品内容合计：{count} 条
+  inventory_row: • {tier}：已录入 {count} 条，计划 {needed} 名中奖者
   inventory_manual: 主办方自行发奖，未录入自动领奖内容。
   confirm_hint: 请发送「确认」发布，或点击「全部删除并重新添加」重新录入奖品。发送 /cancel 放弃。
 poetry:

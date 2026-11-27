@@ -16,9 +16,11 @@ from bot.services import giveaway
 from bot.services.channels import (
     Destination,
     display_requirement,
+    linked_requirement,
     parse_requirements,
     resolve_publication_targets,
 )
+from bot.services.prize import claim_window_notice
 from bot.services.publication import publish_all
 from bot.utils.esc import telegram_text_length
 from bot.utils.prize_input import parse_input
@@ -46,7 +48,7 @@ class GiveawayDraftInput(BaseModel):
     channels: str = Field(default="", max_length=4096)
     groups: str = Field(default="", max_length=4096)
     condition: str = Field(min_length=1, max_length=120)
-    prize_mode: Literal["none", "unique", "shared"]
+    prize_mode: Literal["none", "unique"]
     tiers: list[TierInput] = Field(min_length=1, max_length=40)
 
 
@@ -67,6 +69,7 @@ class PreparedDraft:
     fixed_condition: str
     destinations: list[Destination]
     char_count: int
+    post_preview: str
 
 
 async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedDraft:
@@ -114,21 +117,23 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
     if not (channels or groups):
         raise AdminError("至少填写一个频道或群组。")
 
-    post = render(
-        "giveaway_running",
-        id=2**63 - 1,
+    post_fields = dict(
         title=draft.title,
         description=draft.description,
         prizes=tiers,
-        channels=[display_requirement(value) for value in channels],
-        groups=[display_requirement(value) for value in groups],
+        prize_mode=draft.prize_mode,
+        claim_notice=claim_window_notice(draft.prize_mode),
+        channels=[linked_requirement(value) for value in channels],
+        groups=[linked_requirement(value) for value in groups],
         ends_at=label,
-        count=0,
         commit="0" * 64,
     )
-    post_length = telegram_text_length(post)
+    post_length = telegram_text_length(
+        render("giveaway_running", id=2**63 - 1, count=2**63 - 1, **post_fields)
+    )
     if post_length > 4096:
         raise AdminError("抽奖帖超过 Telegram 的长度限制，请缩短说明或精简奖项。")
+    post_preview = render("giveaway_running", id="预览", count=0, **post_fields)
     try:
         destinations = await resolve_publication_targets(request.app["bot"], channels, groups)
     except ValueError as exc:
@@ -144,7 +149,8 @@ async def _prepare(request: web.Request, draft: GiveawayDraftInput) -> PreparedD
         label,
         fixed_condition,
         destinations,
-        post_length,
+        telegram_text_length(post_preview),
+        post_preview,
     )
 
 
@@ -160,6 +166,7 @@ async def preview(request: web.Request) -> web.Response:
             "groups": [display_requirement(value) for value in prepared.groups],
             "char_count": prepared.char_count,
             "char_limit": 4096,
+            "post_preview": prepared.post_preview,
             "tiers": [
                 {**tier, "inventory": len(codes)}
                 for tier, (_, codes) in zip(prepared.tiers, prepared.inventory, strict=True)

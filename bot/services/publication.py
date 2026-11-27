@@ -18,6 +18,7 @@ from bot.db.models import Giveaway, GiveawayPost, GiveawayStatus
 from bot.db.repo import claim_giveaway, count_participants
 from bot.keyboards.participate import participate_keyboard
 from bot.services.channels import linked_requirement
+from bot.services.prize import claim_window_notice
 from bot.settings import get_settings
 from bot.utils.render import render
 from bot.utils.timeparse import format_draw_condition
@@ -25,8 +26,8 @@ from bot.utils.timeparse import format_draw_condition
 log = logging.getLogger(__name__)
 # 项目按单实例部署；串行发布/补发避免重复发送同一处待发消息。
 _publish_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-# 记录每个已发抽奖帖最近一次展示的报名人数，避免人数未变化时重复调用编辑接口。
-_last_displayed_counts: dict[tuple[str, int, int, int], int] = {}
+# 记录已展示的报名人数和开奖状态，避免重复编辑帖子。
+_last_displayed_states: dict[tuple[str, int, int, int], tuple[int, bool]] = {}
 _SYNC_MIN_INTERVAL = 2.0
 _last_sync_at: dict[int, float] = {}
 _pending_sync_tasks: dict[int, asyncio.Task[None]] = {}
@@ -53,6 +54,9 @@ def render_running_post(gw: Giveaway, count: int) -> str:
         title=gw.title,
         description=gw.description,
         prizes=gw.prize_tiers,
+        prize_mode=gw.prize_mode,
+        claim_notice=claim_window_notice(gw.prize_mode),
+        finished=gw.status == GiveawayStatus.finished,
         channels=[linked_requirement(x) for x in gw.required_channels or ()],
         groups=[linked_requirement(x) for x in gw.required_groups or ()],
         ends_at=format_draw_condition(
@@ -140,7 +144,7 @@ async def publish_all(bot: Bot, gid: int) -> PublicationResult:
                     gw.chat_id, gw.message_id = chat_id, sent.message_id
                 commit_key = gw.draw_commit or ""
                 await session.commit()
-            _last_displayed_counts[(commit_key, gid, chat_id, sent.message_id)] = count
+            _last_displayed_states[(commit_key, gid, chat_id, sent.message_id)] = (count, False)
         async with get_sessionmaker()() as session:
             gw = await claim_giveaway(session, gid, GiveawayStatus.running)
             rows = (
@@ -173,7 +177,7 @@ async def _edit_post_count(
     text: str,
     markup,
     cache_key: tuple[str, int, int, int],
-    count: int,
+    state: tuple[int, bool],
 ) -> bool:
     for attempt in range(2):
         try:
@@ -184,7 +188,7 @@ async def _edit_post_count(
                 reply_markup=markup,
                 link_preview_options={"is_disabled": True},
             )
-            _last_displayed_counts[cache_key] = count
+            _last_displayed_states[cache_key] = state
             return True
         except TelegramRetryAfter as exc:
             if attempt == 0:
@@ -193,7 +197,7 @@ async def _edit_post_count(
             log.warning("刷新抽奖%s人数失败（TelegramRetryAfter）", gid)
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
-                _last_displayed_counts[cache_key] = count
+                _last_displayed_states[cache_key] = state
             else:
                 log.warning("刷新抽奖%s人数失败：%s", gid, exc)
             return False
@@ -219,20 +223,22 @@ async def refresh_giveaway_post_count(
         elif gw.status != GiveawayStatus.running or _expired(gw):
             return 0
         count = await count_participants(session, gid, exclude_blacklisted=True)
+        finished = gw.status == GiveawayStatus.finished
         text = render_running_post(gw, count)
         legacy_chat, legacy_msg = gw.chat_id, gw.message_id
         commit_key = gw.draw_commit or ""
 
+    state = (count, finished)
     locations = await post_locations(gid, legacy_chat, legacy_msg)
     targets = [
         (chat_id, message_id)
         for chat_id, message_id in locations
-        if _last_displayed_counts.get((commit_key, gid, chat_id, message_id)) != count
+        if _last_displayed_states.get((commit_key, gid, chat_id, message_id)) != state
     ]
     if not targets:
         return 0
 
-    markup = participate_keyboard(gid, "zh")
+    markup = None if finished else participate_keyboard(gid, "zh")
     updated = 0
     for chat_id, message_id in targets:
         if await _edit_post_count(
@@ -243,7 +249,7 @@ async def refresh_giveaway_post_count(
             text=text,
             markup=markup,
             cache_key=(commit_key, gid, chat_id, message_id),
-            count=count,
+            state=state,
         ):
             updated += 1
     return updated
@@ -262,9 +268,9 @@ async def refresh_running_post_counts(bot: Bot) -> int:
             )
         )
     active_ids = set(running_ids)
-    for key in list(_last_displayed_counts):
+    for key in list(_last_displayed_states):
         if key[1] not in active_ids:
-            _last_displayed_counts.pop(key, None)
+            _last_displayed_states.pop(key, None)
     for gid in list(_last_sync_at):
         if gid not in active_ids:
             _last_sync_at.pop(gid, None)

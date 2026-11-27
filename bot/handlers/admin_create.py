@@ -100,15 +100,10 @@ async def _ask_codes(message: Message, state: FSMContext, lang: str) -> None:
     owner = data.get("prize_draft_owner", message.from_user.id)
     controls = await review_controls(state, owner, "new", accept=False)
     tier = tiers[index]
-    if data.get("prize_mode") == "shared":
-        await message.answer(
-            t("fsm.enter_codes_shared", lang, tier=tier["name"]), reply_markup=controls
-        )
-    else:
-        await message.answer(
-            t("fsm.enter_codes_unique", lang, tier=tier["name"], count=tier["count"]),
-            reply_markup=controls,
-        )
+    await message.answer(
+        t("fsm.enter_codes_unique", lang, tier=tier["name"], count=tier["count"]),
+        reply_markup=controls,
+    )
 
 
 def _inventory_summary(data: dict, lang: str) -> str:
@@ -157,7 +152,7 @@ async def _review_codes(message: Message, state: FSMContext, lang: str) -> None:
     await state.set_state(GiveawayDraft.waiting_codes_review)
     await message.answer(
         t(
-            "fsm.codes_review_shared" if data.get("prize_mode") == "shared" else "fsm.codes_review",
+            "fsm.codes_review",
             lang,
             tier=tier["name"],
             count=count,
@@ -311,8 +306,6 @@ def build_admin_create_router() -> Router:
             mode = "none"
         elif text in {"1", "unique", "code", "codes", "独立码", "码"}:
             mode = "unique"
-        elif text in {"2", "shared", "text", "shared_text", "共享", "共享文本", "文本"}:
-            mode = "shared"
         else:
             await message.answer(t("fsm.bad_prizemode", lang))
             return

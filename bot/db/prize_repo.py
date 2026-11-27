@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Giveaway, GiveawayStatus, PrizeClaim, PrizeCode, WinnerLog
 from bot.db.repo import claim_giveaway, is_blacklisted
+from bot.prize_policy import CLAIM_WINDOW, SELF_SERVICE_MODES
 from bot.utils.prize_input import normalize_codes
 
 log = logging.getLogger("bot.db.prize_repo")
@@ -22,6 +23,8 @@ CLAIM_ALREADY = "already"
 CLAIM_EMPTY = "empty"
 #: This giveaway is not finished, or the user no longer holds this tier.
 CLAIM_INELIGIBLE = "ineligible"
+#: The winner did not claim within the round's claim window.
+CLAIM_EXPIRED = "expired"
 
 #: How many rows a shared-text giveaway consumes.  One row with a huge cap
 #: keeps the delivery code identical for both modes.
@@ -43,6 +46,8 @@ class TierStock:
     tier_name: str
     total: int
     claimed: int
+    recoverable: int = 0
+    withdrawn: int = 0
 
     @property
     def remaining(self) -> int:
@@ -58,6 +63,16 @@ class PrizeView:
     tier_name: str
     code: str
     claimed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class WinnerClaim:
+    drawn_at: datetime
+    claimed: bool
+
+    @property
+    def deadline(self) -> datetime:
+        return self.drawn_at + CLAIM_WINDOW
 
 
 async def new_unique_codes(
@@ -129,9 +144,11 @@ async def add_codes(
 def _claimable_unique_codes(giveaway_id: int):
     """Only the first stocked copy of each unused code is available."""
     claimed_code_ids = select(PrizeClaim.code_id).where(PrizeClaim.giveaway_id == giveaway_id)
-    issued = select(PrizeCode.code).where(
+    unavailable = select(PrizeCode.code).where(
         PrizeCode.giveaway_id == giveaway_id,
-        (PrizeCode.claimed_count > 0) | (PrizeCode.id.in_(claimed_code_ids)),
+        (PrizeCode.claimed_count > 0)
+        | PrizeCode.id.in_(claimed_code_ids)
+        | PrizeCode.withdrawn_at.is_not(None),
     )
     return (
         select(func.min(PrizeCode.id))
@@ -139,33 +156,107 @@ def _claimable_unique_codes(giveaway_id: int):
             PrizeCode.giveaway_id == giveaway_id,
             PrizeCode.claimed_count == 0,
             PrizeCode.claimed_count < PrizeCode.max_claims,
-            PrizeCode.code.not_in(issued),
+            PrizeCode.code.not_in(unavailable),
         )
         .group_by(PrizeCode.code)
     )
 
 
+def _winner_has_claim():
+    return (
+        select(PrizeClaim.id)
+        .where(
+            PrizeClaim.giveaway_id == WinnerLog.giveaway_id,
+            PrizeClaim.user_id == WinnerLog.user_id,
+            PrizeClaim.tier_name == WinnerLog.tier_name,
+        )
+        .exists()
+    )
+
+
+def _recoverable_tiers(giveaway_id: int, now: datetime):
+    """Tiers with expired unclaimed awards and no remaining open claim windows."""
+    cutoff = now - CLAIM_WINDOW
+    open_award = WinnerLog.replaced_at.is_(None) & (WinnerLog.drawn_at > cutoff)
+    return (
+        select(WinnerLog.tier_name)
+        .where(
+            WinnerLog.giveaway_id == giveaway_id,
+            ~_winner_has_claim(),
+        )
+        .group_by(WinnerLog.tier_name)
+        .having(
+            func.min(WinnerLog.drawn_at) <= cutoff,
+            func.sum(case((open_award, 1), else_=0)) == 0,
+        )
+    )
+
+
+async def withdraw_recovered_codes(
+    session: AsyncSession, giveaway_id: int, creator_id: int
+) -> list[str] | None:
+    """Move recovered codes out of awardable stock and keep them for repeat downloads."""
+    giveaway = await claim_giveaway(session, giveaway_id, GiveawayStatus.finished)
+    if (
+        giveaway is None
+        or giveaway.publishing
+        or giveaway.creator_id != creator_id
+        or giveaway.prize_mode != "unique"
+    ):
+        return None
+
+    now = datetime.now(UTC)
+    await session.execute(
+        update(PrizeCode)
+        .where(
+            PrizeCode.giveaway_id == giveaway_id,
+            PrizeCode.tier_name.in_(_recoverable_tiers(giveaway_id, now)),
+            PrizeCode.id.in_(_claimable_unique_codes(giveaway_id)),
+        )
+        .values(withdrawn_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    return list(
+        await session.scalars(
+            select(PrizeCode.code)
+            .where(PrizeCode.giveaway_id == giveaway_id, PrizeCode.withdrawn_at.is_not(None))
+            .order_by(PrizeCode.id)
+        )
+    )
+
+
 async def stock_by_tier(session: AsyncSession, giveaway_id: int) -> dict[str, TierStock]:
-    """Total / claimed / remaining per tier, for the admin panel."""
-    mode = await session.scalar(select(Giveaway.prize_mode).where(Giveaway.id == giveaway_id))
+    """Inventory and recovered codes per tier, for the admin panel."""
+    giveaway = await session.get(Giveaway, giveaway_id)
+    if giveaway is None:
+        return {}
+    recoverable_tiers: set[str] = set()
     total = func.sum(PrizeCode.max_claims)
-    if mode == "unique":
+    if giveaway.prize_mode == "unique":
         available = case((PrizeCode.id.in_(_claimable_unique_codes(giveaway_id)), 1), else_=0)
         total = func.sum(PrizeCode.claimed_count + available)
+        if giveaway.status == GiveawayStatus.finished and not giveaway.publishing:
+            recoverable_tiers = set(
+                await session.scalars(_recoverable_tiers(giveaway_id, datetime.now(UTC)))
+            )
     rows = (
         await session.execute(
             select(
                 PrizeCode.tier_name,
                 total,
                 func.sum(PrizeCode.claimed_count),
+                func.count(PrizeCode.withdrawn_at),
             )
             .where(PrizeCode.giveaway_id == giveaway_id)
             .group_by(PrizeCode.tier_name)
         )
     ).all()
-    return {
-        name: TierStock(name, int(total or 0), int(claimed or 0)) for name, total, claimed in rows
-    }
+    stock = {}
+    for name, total_count, claimed_count, withdrawn in rows:
+        total_count, claimed_count = int(total_count or 0), int(claimed_count or 0)
+        recoverable = max(total_count - claimed_count, 0) if name in recoverable_tiers else 0
+        stock[name] = TierStock(name, total_count, claimed_count, recoverable, withdrawn)
+    return stock
 
 
 async def has_claim(
@@ -192,6 +283,21 @@ async def current_winner_tiers(
     return set(tiers)
 
 
+async def current_winner_claims(
+    session: AsyncSession, giveaway_id: int, user_id: int
+) -> dict[str, WinnerClaim]:
+    rows = await session.execute(
+        select(WinnerLog.tier_name, WinnerLog.drawn_at, _winner_has_claim().label("claimed"))
+        .where(
+            WinnerLog.giveaway_id == giveaway_id,
+            WinnerLog.user_id == user_id,
+            WinnerLog.replaced_at.is_(None),
+        )
+        .order_by(WinnerLog.drawn_at)
+    )
+    return {tier: WinnerClaim(drawn_at, claimed) for tier, drawn_at, claimed in rows}
+
+
 async def claim_code(
     session: AsyncSession, *, giveaway_id: int, user_id: int, tier_name: str
 ) -> ClaimOutcome:
@@ -205,14 +311,19 @@ async def claim_code(
     if (
         gw is None
         or gw.publishing
-        or gw.prize_mode not in {"unique", "shared"}
+        or gw.prize_mode not in SELF_SERVICE_MODES
         or await is_blacklisted(session, user_id)
-        or tier not in await current_winner_tiers(session, giveaway_id, user_id)
     ):
         return ClaimOutcome(CLAIM_INELIGIBLE)
 
-    if await has_claim(session, giveaway_id=giveaway_id, user_id=user_id, tier_name=tier):
+    winner = (await current_winner_claims(session, giveaway_id, user_id)).get(tier)
+    if winner is None:
+        return ClaimOutcome(CLAIM_INELIGIBLE)
+    if winner.claimed:
         return ClaimOutcome(CLAIM_ALREADY)
+    now = datetime.now(UTC)
+    if winner.deadline <= now:
+        return ClaimOutcome(CLAIM_EXPIRED)
 
     available = select(PrizeCode).where(
         PrizeCode.giveaway_id == giveaway_id,
@@ -245,6 +356,7 @@ async def claim_code(
             tier_name=tier,
             user_id=user_id,
             code_id=row.id,
+            claimed_at=now,
         )
     )
     try:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from bot.db.models import GiveawayStatus
-from bot.db.prize_repo import CLAIM_OK
+from bot.db.prize_repo import CLAIM_EXPIRED, CLAIM_OK
 from bot.db.repo import (
     add_participant,
     ban_user,
@@ -21,9 +21,11 @@ from bot.db.repo import (
     list_winners,
     replace_tier_winners,
 )
+from bot.prize_policy import CLAIM_WINDOW
 from bot.services import giveaway as gw_service
 from bot.services import prize as prize_service
 from bot.services.giveaway import RerollError, finalize_and_publish, reroll_tier
+from tests.conftest import ADMIN_ID
 
 
 async def _join(session, giveaway_id, user_ids):
@@ -89,7 +91,7 @@ async def test_draw_awards_the_tier_and_finishes(sessionmaker, due_giveaway, bot
 async def test_draw_publishes_under_the_post_and_dms_the_winner(
     sessionmaker, due_giveaway, bot
 ):
-    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}], prize_mode="unique")
     async with sessionmaker() as session:
         await _join(session, gid, [1001])
         await session.commit()
@@ -100,9 +102,12 @@ async def test_draw_publishes_under_the_post_and_dms_the_winner(
     public = [m for m in bot.sent if m[0] == -100123]
     assert len(public) == 1
     assert public[0][2].get("reply_to_message_id") == 42
+    assert "48 小时" in public[0][1] and "自动回收" in public[0][1]
     dms = [m for m in bot.sent if m[0] == 1001]
     assert len(dms) == 1, "the winner is told directly"
     assert "Key" in dms[0][1]
+    assert "48 小时" in dms[0][1] and "自动回收" in dms[0][1]
+    assert "领奖截止" in dms[0][1]
 
 
 async def test_one_user_cannot_win_two_tiers(sessionmaker, due_giveaway, bot):
@@ -142,8 +147,8 @@ async def test_shortfall_is_announced_in_public(sessionmaker, due_giveaway, bot)
     await finalize_and_publish(gid, bot)
 
     public = [m for m in bot.sent if m[0] == -100123][0][1]
-    assert "Rare" in public
-    assert "3" in public
+    assert "本轮中奖人数：1 人" in public
+    assert "空缺 2 个名额" in public
 
 
 async def test_blacklisted_participant_is_excluded_from_the_draw(
@@ -261,7 +266,7 @@ async def test_reroll_replaces_and_keeps_the_old_draw(
     sessionmaker, due_giveaway, bot
 ):
     """P1-4: the audit trail is kept, the live result is replaced."""
-    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}])
+    gid = await due_giveaway(prize_tiers=[{"name": "Key", "count": 1}], prize_mode="unique")
     async with sessionmaker() as session:
         await _join(session, gid, [1001, 1002, 1003])
         await session.commit()
@@ -269,6 +274,11 @@ async def test_reroll_replaces_and_keeps_the_old_draw(
     await finalize_and_publish(gid, bot)
     async with sessionmaker() as session:
         first = await current_winner_ids(session, gid)
+        original = (await list_winners(session, gid))[0]
+        original.drawn_at -= CLAIM_WINDOW
+        await session.commit()
+    await prize_service.add_codes(gid, "Key", ["FRESH-WINNER-CODE"])
+    assert (await prize_service.claim(gid, next(iter(first)), "Key")).status == CLAIM_EXPIRED
 
     picks, shortfall = await reroll_tier(gid, "Key", bot)
 
@@ -285,6 +295,8 @@ async def test_reroll_replaces_and_keeps_the_old_draw(
     assert len(superseded) == 1, "the old draw is stamped, not deleted"
     assert {superseded[0].user_id} == first
     assert live[0].user_id in {1001, 1002, 1003}
+    assert await prize_service.withdraw_recovered_codes(gid, ADMIN_ID) == []
+    assert (await prize_service.claim(gid, live[0].user_id, "Key")).code == "FRESH-WINNER-CODE"
 
 
 async def test_reroll_never_rewards_the_same_person_twice(
@@ -442,6 +454,7 @@ async def test_large_multi_tier_draw_300_winners_no_duplicates_and_reproducible(
     assert [(w.user_id, w.tier_name) for w in live] == expected
 
     public_posts = [text for chat, text, _ in bot.sent if chat == -100123]
-    assert len(public_posts) == 4
-    assert all("<blockquote expandable>" in msg and "</blockquote>" in msg for msg in public_posts)
-    assert any(seed in msg for msg in public_posts)
+    assert len(public_posts) == 1
+    assert seed in public_posts[0]
+    assert "本轮中奖人数：300 人" in public_posts[0]
+    assert "tg://user?id=" not in public_posts[0]

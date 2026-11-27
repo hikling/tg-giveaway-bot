@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from datetime import UTC, datetime
 from html import unescape
 
 from aiogram import Bot, F, Router
@@ -13,12 +15,21 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from bot.callbacks.factories import ClaimCb, PrizeDraftCb
 from bot.db.base import get_sessionmaker
-from bot.db.models import GiveawayStatus
-from bot.db.prize_repo import CLAIM_ALREADY, CLAIM_EMPTY, CLAIM_INELIGIBLE, CLAIM_OK
+from bot.db.models import Giveaway, GiveawayStatus
+from bot.db.prize_repo import (
+    CLAIM_ALREADY,
+    CLAIM_EMPTY,
+    CLAIM_EXPIRED,
+    CLAIM_INELIGIBLE,
+    CLAIM_OK,
+    WinnerClaim,
+    current_winner_claims,
+)
 from bot.db.repo import get_giveaway, is_blacklisted
 from bot.filters.admin import IsAdmin
 from bot.handlers.common import answer_notice, lang_of
 from bot.i18n import t
+from bot.prize_policy import CLAIM_WINDOW_HOURS, SELF_SERVICE_MODES
 from bot.services import prize as prize_service
 from bot.services.scheduler import GiveawayScheduler
 from bot.utils.esc import telegram_text_length
@@ -36,6 +47,7 @@ log = logging.getLogger("bot.handlers.prize")
 _DELIVERY_FAILED = "delivery_failed"
 _CLAIM_FEEDBACK = {
     CLAIM_ALREADY: "prize.already",
+    CLAIM_EXPIRED: "prize.expired",
     CLAIM_INELIGIBLE: "prize.not_winner",
     _DELIVERY_FAILED: "prize.dm_failed",
 }
@@ -98,8 +110,43 @@ async def _claim_one(
     return outcome.status
 
 
+def _giveaway_id(args: str | None) -> int | None:
+    text = (args or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", text) or int(text) > 2**63 - 1:
+        return None
+    return int(text)
+
+
+def _winner_result(giveaway: Giveaway, awards: dict[str, WinnerClaim]) -> str:
+    if not awards:
+        return t("result.not_won", id=giveaway.id, title=giveaway.title)
+    lines = [
+        t("result.won", id=giveaway.id, title=giveaway.title, tiers="、".join(sorted(awards)))
+    ]
+    if giveaway.prize_mode not in SELF_SERVICE_MODES:
+        lines.extend([t("result.host"), prize_service.claim_window_notice(giveaway.prize_mode)])
+        return "\n".join(lines)
+
+    now = datetime.now(UTC)
+    open_deadlines = [
+        award.deadline for award in awards.values() if not award.claimed and award.deadline > now
+    ]
+    if open_deadlines:
+        lines.append(t("result.claim", id=giveaway.id))
+        lines.append(prize_service.claim_deadline_notice(min(open_deadlines)))
+    expired = sorted(
+        tier for tier, award in awards.items() if not award.claimed and award.deadline <= now
+    )
+    if expired:
+        lines.append(t("result.expired", tiers="、".join(expired)))
+    claimed = sorted(tier for tier, award in awards.items() if award.claimed)
+    if claimed:
+        lines.append(t("result.already", tiers="、".join(claimed)))
+    return "\n".join(lines)
+
+
 def build_prize_router() -> Router:
-    """Winner-facing routes: the claim button, /claim and /myprizes."""
+    """Private results, the claim button, /claim and /myprizes."""
     router = Router(name="prize")
 
     @router.callback_query(ClaimCb.filter())
@@ -140,9 +187,34 @@ def build_prize_router() -> Router:
             creator_id=gw.creator_id,
         )
         if key := _CLAIM_FEEDBACK.get(status):
-            await cq.answer(t(key, lang), show_alert=True)
+            await cq.answer(t(key, lang, hours=CLAIM_WINDOW_HOURS), show_alert=True)
         else:
             await cq.answer()
+
+    @router.message(Command("result"))
+    async def on_result(
+        message: Message, command: CommandObject, scheduler: GiveawayScheduler
+    ) -> None:
+        uid = message.from_user.id
+        if message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
+            await answer_notice(message, t("common.in_private_only"), scheduler)
+            return
+        gid = _giveaway_id(command.args)
+        if gid is None:
+            await message.answer(t("result.usage"))
+            return
+        async with get_sessionmaker()() as session:
+            giveaway = await get_giveaway(session, gid)
+            if giveaway is None:
+                response = t("prize.unknown")
+            elif giveaway.status == GiveawayStatus.canceled:
+                response = t("giveaway.canceled", id=gid)
+            elif giveaway.status != GiveawayStatus.finished or giveaway.publishing:
+                response = t("result.pending", id=gid, title=giveaway.title)
+            else:
+                awards = await current_winner_claims(session, gid, uid)
+                response = _winner_result(giveaway, awards)
+        await message.answer(response)
 
     @router.message(Command("claim"))
     async def on_claim_command(
@@ -191,6 +263,10 @@ def build_prize_router() -> Router:
             statuses.add(status)
         if _DELIVERY_FAILED in statuses:
             await answer_notice(message, t("prize.dm_failed", lang), scheduler)
+        elif CLAIM_EXPIRED in statuses:
+            await answer_notice(
+                message, t("prize.expired", lang, hours=CLAIM_WINDOW_HOURS), scheduler
+            )
         elif statuses.isdisjoint({CLAIM_OK, CLAIM_EMPTY}):
             key = "prize.already" if CLAIM_ALREADY in statuses else "prize.not_winner"
             await answer_notice(message, t(key, lang), scheduler)
@@ -273,7 +349,7 @@ async def _accept_stock(message: Message, state: FSMContext) -> None:
 
 
 def build_prize_admin_router() -> Router:
-    """Admin stock routes: /addcodes and /prizestatus."""
+    """Admin stock routes: /addcodes, /prizestatus and /reclaim."""
     router = Router(name="prize_admin")
     router.message.filter(IsAdmin())
 
@@ -304,7 +380,44 @@ def build_prize_admin_router() -> Router:
                     remaining=tier.remaining,
                 )
             )
+        recoverable = sum(tier.recoverable for tier in stock.values())
+        withdrawn = sum(tier.withdrawn for tier in stock.values())
+        if recoverable or withdrawn:
+            lines.extend([
+                "",
+                t("prize.recovery_stock", lang, recoverable=recoverable, withdrawn=withdrawn),
+                t("prize.reclaim_hint", lang, id=gid),
+            ])
         await answer_notice(message, "\n".join(lines), scheduler)
+
+    @router.message(Command("reclaim"))
+    async def on_reclaim(
+        message: Message, command: CommandObject, bot: Bot, scheduler: GiveawayScheduler
+    ) -> None:
+        uid = message.from_user.id
+        if message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
+            await answer_notice(message, t("common.in_private_only"), scheduler)
+            return
+        gid = _giveaway_id(command.args)
+        if gid is None:
+            await message.answer(t("prize.reclaim_usage"))
+            return
+        codes = await prize_service.withdraw_recovered_codes(gid, uid)
+        if codes is None:
+            await message.answer(t("prize.reclaim_unavailable"))
+            return
+        if not codes:
+            await message.answer(t("prize.reclaim_empty", id=gid))
+            return
+        document = BufferedInputFile(
+            ("\n".join(codes) + "\n").encode("utf-8"), filename=f"giveaway-{gid}-recovered.txt"
+        )
+        try:
+            await bot.send_document(
+                uid, document, caption=t("prize.reclaim_caption", id=gid, count=len(codes))
+            )
+        except (TelegramAPIError, TimeoutError):
+            await message.answer(t("prize.reclaim_retry", id=gid))
 
     @router.message(Command("addcodes"))
     @serialize_draft

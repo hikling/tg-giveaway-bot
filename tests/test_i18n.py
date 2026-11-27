@@ -45,7 +45,7 @@ def test_escaping_is_applied_to_every_placeholder():
 
 
 def test_old_language_codes_resolve_to_known_chinese_keys():
-    for key in ("start.welcome", "join.ok", "giveaway.winner_line", "fsm.confirm"):
+    for key in ("start.welcome", "join.ok", "giveaway.result_check", "fsm.confirm"):
         for lang in ("en", "zh"):
             assert t(key, lang) != key, f"{key} missing in {lang}"
 

@@ -482,7 +482,7 @@ async def test_creator_sets_channel_group_and_count_condition_then_publishes(ses
         assert games[0].required_groups == ["-100222|https://t.me/+invite|交流群"]
         assert games[0].draw_mode == "count" and games[0].target_participants == 100
     post = bot.sent[-1][1]
-    assert "必加群组" in post and "满 100 人" in post and "60秒" in post
+    assert "必加群组" in post and "满 100 人" in post and "60 秒" in post
     assert "9999" not in post and "invite" in post
     assert await state.get_state() is None
 

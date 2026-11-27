@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime
 from typing import Literal
 
 from aiogram.exceptions import TelegramAPIError
@@ -9,6 +10,7 @@ from aiogram.types import MenuButtonDefault
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from bot.db.base import get_sessionmaker
 from bot.db.models import (
@@ -16,6 +18,7 @@ from bot.db.models import (
     Giveaway,
     GiveawayPost,
     GiveawayStatus,
+    HiddenLocation,
     Participant,
     PrizeClaim,
 )
@@ -34,6 +37,7 @@ from bot.db.repo import (
     remove_admin,
     unban_user,
 )
+from bot.prize_policy import CLAIM_WINDOW, SELF_SERVICE_MODES
 from bot.services import giveaway as giveaway_service
 from bot.services import prize as prize_service
 from bot.services.admin_menu import set_admin_menu
@@ -61,6 +65,12 @@ class AccessAction(BaseModel):
     action: Literal["ban", "unban", "add-admin", "remove-admin"]
     user_id: str = Field(max_length=19)
     reason: str = Field(default="", max_length=512)
+
+
+class LocationRemoval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["channels", "groups"]
+    reference: str = Field(pattern=r"^(?:@[a-z][a-z0-9_]{0,31}|-[1-9][0-9]{0,18})$")
 
 
 def _id(value: str, message: str) -> int:
@@ -199,9 +209,12 @@ async def giveaway_detail(request: web.Request) -> web.Response:
                 "total": inventory.total if inventory else 0,
                 "claimed": inventory.claimed if inventory else 0,
                 "remaining": inventory.remaining if inventory else 0,
+                "recoverable": inventory.recoverable if inventory else 0,
+                "withdrawn": inventory.withdrawn if inventory else 0,
                 "rerollable": gw.status == GiveawayStatus.finished and name not in claimed_tiers,
             }
         )
+    cutoff = datetime.now(UTC) - CLAIM_WINDOW
     winners = [
         {
             "user_id": str(row.user_id),
@@ -211,6 +224,11 @@ async def giveaway_detail(request: web.Request) -> web.Response:
             "notified_at": row.notified_at.isoformat() if row.notified_at else None,
             "notify_error": row.notify_error,
             "claimed": (row.user_id, row.tier_name) in claimed_pairs,
+            "claim_expired": (
+                gw.prize_mode in SELF_SERVICE_MODES
+                and row.drawn_at <= cutoff
+                and (row.user_id, row.tier_name) not in claimed_pairs
+            ),
         }
         for row in winner_rows
     ]
@@ -219,6 +237,7 @@ async def giveaway_detail(request: web.Request) -> web.Response:
             **_summary(gw, len(ids), settings.tz),
             "description": gw.description,
             "prize_mode": gw.prize_mode,
+            "can_withdraw_codes": gw.creator_id == request["admin_id"] and gw.prize_mode == "unique",
             "tiers": tiers,
             "channels": [display_requirement(raw) for raw in gw.required_channels or []],
             "groups": [display_requirement(raw) for raw in gw.required_groups or []],
@@ -322,10 +341,17 @@ async def giveaway_action(request: web.Request) -> web.Response:
     return web.json_response(await _stock_action(gw, payload, tier))
 
 
-async def location_options(_request: web.Request) -> web.Response:
-    channels: dict[str, dict] = {}
-    groups: dict[str, dict] = {}
+async def location_options(request: web.Request) -> web.Response:
+    options: dict[str, dict[str, dict]] = {"channels": {}, "groups": {}}
     async with get_sessionmaker()() as session:
+        hidden = set(
+            (
+                await session.execute(
+                    select(HiddenLocation.kind, HiddenLocation.reference)
+                    .where(HiddenLocation.admin_id == request["admin_id"])
+                )
+            ).all()
+        )
         rows = (
             await session.execute(
                 select(Giveaway.required_channels, Giveaway.required_groups)
@@ -334,23 +360,35 @@ async def location_options(_request: web.Request) -> web.Response:
             )
         ).all()
     for ch_list, gp_list in rows:
-        for raw in ch_list or []:
-            if raw not in channels and len(channels) < 24:
-                channels[raw] = {
+        for kind, entries in (("channels", ch_list), ("groups", gp_list)):
+            choices = options[kind]
+            for raw in entries or ():
+                reference = raw.partition("|")[0].strip().lower()
+                if (kind, reference) in hidden or reference in choices or len(choices) >= 24:
+                    continue
+                choices[reference] = {
                     "name": display_requirement(raw),
                     "line": format_requirement_line(raw),
-                    "private": raw.startswith("-"),
+                    "private": reference.startswith("-"),
+                    "reference": reference,
                 }
-        for raw in gp_list or []:
-            if raw not in groups and len(groups) < 24:
-                groups[raw] = {
-                    "name": display_requirement(raw),
-                    "line": format_requirement_line(raw),
-                    "private": raw.startswith("-"),
-                }
-    return web.json_response(
-        {"channels": list(channels.values()), "groups": list(groups.values())}
-    )
+    return web.json_response({kind: list(items.values()) for kind, items in options.items()})
+
+
+async def remove_location_option(request: web.Request) -> web.Response:
+    payload = await read_payload(request, LocationRemoval)
+    async with get_sessionmaker()() as session:
+        session.add(
+            HiddenLocation(
+                admin_id=request["admin_id"], kind=payload.kind, reference=payload.reference
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            # The preference already exists, including when the request is retried.
+            await session.rollback()
+    return web.json_response({"removed": True})
 
 
 async def access_details(request: web.Request) -> web.Response:

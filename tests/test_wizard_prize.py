@@ -74,7 +74,7 @@ async def test_unique_codes_are_collected_then_confirmation_is_shown(sessionmake
 
 
 @pytest.mark.asyncio
-async def test_shared_text_keeps_its_newlines(sessionmaker) -> None:
+async def test_new_giveaway_no_longer_offers_shared_text(sessionmaker) -> None:
     fsm = _ctx()
     await fsm.update_data(
         end_at_iso=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
@@ -84,14 +84,11 @@ async def test_shared_text_keeps_its_newlines(sessionmaker) -> None:
     await fsm.set_state(GiveawayDraft.waiting_prizemode)
     await fsm.update_data(prizes=[{"name": "Steam card", "count": 1}])
 
-    await _handler("step_prizemode")(FakeMessage("2"), fsm)
-    assert (await fsm.get_data())["prize_mode"] == "shared"
-
-    text = "line one\nline two"
-    await _handler("step_codes")(FakeMessage(text), fsm)
-    await _handler("step_codes")(FakeMessage("确认奖品"), fsm)
-    buffer = (await fsm.get_data())["codes_buffer"]
-    assert buffer == [["Steam card", [text]]]
+    message = FakeMessage("2")
+    await _handler("step_prizemode")(message, fsm)
+    assert await fsm.get_state() == GiveawayDraft.waiting_prizemode.state
+    assert "prize_mode" not in await fsm.get_data()
+    assert "一人一码" in message.answers[-1]
 
 
 @pytest.mark.asyncio

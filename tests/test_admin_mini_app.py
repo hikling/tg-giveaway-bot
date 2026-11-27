@@ -14,7 +14,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from sqlalchemy import select
 
-from bot.db.models import Giveaway, GiveawayStatus, PrizeCode
+from bot.db.models import Giveaway, GiveawayStatus, PrizeCode, WinnerLog
 from bot.db.repo import (
     add_admin,
     add_participant,
@@ -24,6 +24,8 @@ from bot.db.repo import (
     mark_winner_notified,
     remove_admin,
 )
+from bot.prize_policy import CLAIM_WINDOW
+from bot.services import prize as prize_service
 from bot.settings import Settings
 from bot.web.routes import register_web_routes
 from tests.conftest import ADMIN_ID, BOT_ID
@@ -76,6 +78,7 @@ async def test_enabled_mini_app_serves_page_and_assets(mini_app):
     response = await client.get("/admin/")
     assert response.status == 200 and response.content_type == "text/html"
     page = await response.text()
+    assert 'name="prize_mode" value="shared"' not in page
     expected_assets = {
         "/admin/assets/app.css": {"text/css"},
         "/admin/assets/app.js": {"application/javascript", "text/javascript"},
@@ -155,6 +158,9 @@ async def test_create_preview_retry_and_republish_use_same_giveaway(mini_app, se
     assert response.status == 200, await response.text()
     preview = await response.json()
     assert preview["tiers"] == [{"name": "一档", "count": 2, "inventory": 2}]
+    assert "一人一码" in preview["post_preview"]
+    assert "48 小时" in preview["post_preview"] and "自动回收" in preview["post_preview"]
+    assert '<a href="https://t.me/news">官方频道</a>' in preview["post_preview"]
     assert set(preview["destinations"]) == {"官方频道", "交流群"}
     assert not bot.sent
     async with sessionmaker() as session:
@@ -281,6 +287,23 @@ async def test_index_search_counts_detail_winners_and_access_management(
     assert fin_detail["winners"][0]["user_id"] == "1001"
     assert fin_detail["winners"][0]["username"] == "lucky_winner"
     assert fin_detail["winners"][0]["notified_ok"] is False
+    assert fin_detail["winners"][0]["claim_expired"] is False
+
+    await prize_service.add_codes(gid_finished, "Steam card", ["PRIVATE-UNISSUED-CODE"])
+    async with sessionmaker() as session:
+        winner = await session.get(WinnerLog, rows[0].id)
+        winner.drawn_at -= CLAIM_WINDOW
+        await session.commit()
+    detail_path = f"/admin/api/giveaways/{gid_finished}"
+    res = await client.get(detail_path, headers=headers)
+    expired_detail = await res.json()
+    assert expired_detail["winners"][0]["claim_expired"] is True
+    assert expired_detail["pending_notifications"] == 0
+    assert expired_detail["tiers"][0]["recoverable"] == 1
+    assert expired_detail["can_withdraw_codes"] is True
+    assert "PRIVATE-UNISSUED-CODE" not in await res.text()
+    res = await client.get(detail_path, headers=admin_headers(DB_ADMIN_ID))
+    assert (await res.json())["can_withdraw_codes"] is False
 
     # Access lists blacklist and lets admin remove dynamic DB admins (but not configured or self)
     res = await client.get("/admin/api/access", headers=headers)
@@ -306,6 +329,64 @@ async def test_index_search_counts_detail_winners_and_access_management(
     assert bot.set_chat_menu_button.await_count >= 1
 
 
+async def test_removing_a_recent_location_persists_for_the_current_admin(
+    mini_app, sessionmaker, new_giveaway
+):
+    client, _, _ = mini_app
+    async with sessionmaker() as session:
+        await add_admin(session, DB_ADMIN_ID, added_by=ADMIN_ID)
+        await session.commit()
+    history_id = await new_giveaway(
+        required_channels=["@NEWS|https://t.me/news|旧频道名"],
+        required_groups=["-100222|https://t.me/+invite|交流群"],
+    )
+    headers = admin_headers()
+    path = "/admin/api/locations"
+    payload = {"kind": "channels", "reference": "@news"}
+    assert (
+        await client.post(path + "/remove", headers=admin_headers(NON_ADMIN_ID), json=payload)
+    ).status == 403
+    for _ in range(2):
+        assert (await client.post(path + "/remove", headers=headers, json=payload)).status == 200
+
+    await new_giveaway(required_channels=["@news|https://t.me/news|新频道名"])
+    mine = await (await client.get(path, headers=headers)).json()
+    assert mine["channels"] == []
+    assert mine["groups"][0]["reference"] == "-100222"
+    other = await (await client.get(path, headers=admin_headers(DB_ADMIN_ID))).json()
+    assert [item["name"] for item in other["channels"]] == ["新频道名"]
+    async with sessionmaker() as session:
+        giveaway = await session.get(Giveaway, history_id)
+        assert giveaway.required_channels == ["@NEWS|https://t.me/news|旧频道名"]
+
+
+async def test_new_giveaway_rejects_shared_text_and_escapes_preview(mini_app):
+    client, _, _ = mini_app
+    headers = admin_headers()
+    draft = {
+        "title": "<img src=x onerror=alert(1)>",
+        "channels": "官方频道 | https://t.me/news",
+        "condition": "1h",
+        "prize_mode": "shared",
+        "tiers": [{"name": "一档", "count": 2}],
+    }
+    for path, payload in [
+        ("/create/preview", draft),
+        ("/create", {**draft, "request_id": str(uuid4())}),
+    ]:
+        response = await client.post("/admin/api" + path, headers=headers, json=payload)
+        assert response.status == 400
+
+    response = await client.post(
+        "/admin/api/create/preview", headers=headers, json={**draft, "prize_mode": "none"}
+    )
+    assert response.status == 200
+    preview = (await response.json())["post_preview"]
+    assert "&lt;img src=x onerror=alert(1)&gt;" in preview
+    assert "<img" not in preview
+    assert "主办方联系发奖" in preview
+
+
 async def test_locations_endpoint_single_or_multi_and_canceled_stock_guard(
     mini_app, new_giveaway, monkeypatch
 ):
@@ -320,10 +401,16 @@ async def test_locations_endpoint_single_or_multi_and_canceled_stock_guard(
     assert res.status == 200
     locs = await res.json()
     assert locs["channels"] == [
-        {"name": "官方频道", "line": "官方频道 | https://t.me/news", "private": False}
+        {
+            "name": "官方频道", "line": "官方频道 | https://t.me/news",
+            "private": False, "reference": "@news",
+        }
     ]
     assert locs["groups"] == [
-        {"name": "交流群", "line": "交流群 | https://t.me/+invite | -100222", "private": True}
+        {
+            "name": "交流群", "line": "交流群 | https://t.me/+invite | -100222",
+            "private": True, "reference": "-100222",
+        }
     ]
 
     # Single channel only

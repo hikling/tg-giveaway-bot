@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from bot.db import prize_repo
 from bot.db.base import get_sessionmaker
 from bot.db.prize_repo import CLAIM_OK, SHARED_CAP, ClaimOutcome, PrizeView, TierStock
 from bot.db.repo import claim_giveaway
+from bot.i18n import t
+from bot.prize_policy import CLAIM_WINDOW_HOURS, SELF_SERVICE_MODES
+from bot.settings import get_settings
+from bot.utils.timeparse import format_local
+
+
+def claim_window_notice(prize_mode: str, lang: str | None = None) -> str:
+    key = "prize.claim_window" if prize_mode in SELF_SERVICE_MODES else "prize.manual_window"
+    return t(key, lang, hours=CLAIM_WINDOW_HOURS)
+
+
+def claim_deadline_notice(deadline: datetime, lang: str | None = None) -> str:
+    tz = get_settings().tz
+    label = "北京时间" if tz == "Asia/Shanghai" else tz
+    return t("prize.claim_deadline", lang, deadline=format_local(deadline, tz, seconds=True), tz=label)
 
 
 def tier_at(prize_tiers: Sequence[dict[str, Any]], index: int) -> dict[str, Any] | None:
@@ -61,6 +77,14 @@ async def stock(giveaway_id: int) -> dict[str, TierStock]:
     sm = get_sessionmaker()
     async with sm() as session:
         return await prize_repo.stock_by_tier(session, giveaway_id)
+
+
+async def withdraw_recovered_codes(giveaway_id: int, creator_id: int) -> list[str] | None:
+    async with get_sessionmaker()() as session:
+        codes = await prize_repo.withdraw_recovered_codes(session, giveaway_id, creator_id)
+        if codes is not None:
+            await session.commit()
+        return codes
 
 
 async def claimed_by(user_id: int) -> list[PrizeView]:

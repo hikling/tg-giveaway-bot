@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -22,7 +23,7 @@ from bot.services.channels import (
     resolve_destinations,
 )
 from bot.services.giveaway import create, finalize_and_publish
-from bot.services.publication import post_locations, publish_all
+from bot.services.publication import post_locations, publish_all, render_running_post
 from bot.services.scheduler import GiveawayScheduler
 from tests.conftest import FakeBot
 from tests.test_poetry import begin, choose, stored
@@ -161,11 +162,23 @@ async def test_all_posts_share_entry_and_draw_results_go_to_both_locations(sessi
         game = await session.get(Giveaway, gw.id)
         game.end_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
+    bot.edit_message_text = AsyncMock()
     await finalize_and_publish(gw.id, bot)
-    notices = [(chat, kw) for chat, text, kw in bot.sent if "中奖名单" in text]
+    notices = [(chat, kw) for chat, text, kw in bot.sent if "本轮中奖人数" in text]
     assert {chat for chat, _ in notices} == {-100111, -100222}
     assert all(kw.get("reply_to_message_id") for _, kw in notices)
     assert len([text for chat, text, _ in bot.sent if chat == 1001 and "恭喜" in text]) == 1
+    edits = bot.edit_message_text.await_args_list
+    assert {edit.kwargs["chat_id"] for edit in edits} == {-100111, -100222}
+    assert all("已开奖" in edit.args[0] and f"/result {gw.id}" in edit.args[0] for edit in edits)
+    assert all(edit.kwargs["reply_markup"] is None for edit in edits)
+
+
+async def test_legacy_shared_prize_post_explains_how_to_claim(sessionmaker, new_giveaway):
+    gid = await new_giveaway(prize_mode="shared")
+    async with sessionmaker() as session:
+        post = render_running_post(await session.get(Giveaway, gid), count=0)
+    assert "共同领取" in post and "同一份内容" in post
 
 
 async def test_partial_failure_can_retry_without_duplicate_posts(sessionmaker):
@@ -252,7 +265,7 @@ async def test_lottery_deadline_during_publication_is_finalized_after_send(sessi
     await publish_all(bot, gw.id)
     async with sessionmaker() as session:
         assert (await session.get(Giveaway, gw.id)).status == GiveawayStatus.finished
-    assert any("已结束" in text for _, text, _ in bot.sent)
+    assert any("已开奖" in text for _, text, _ in bot.sent)
 
 
 async def test_retired_question_is_replaced_without_deducting_a_chance(
@@ -398,7 +411,7 @@ async def test_refresh_running_post_counts_updates_posts_and_scheduler_runs_ever
     # Simulates "message is not modified" after restart (empty cache)
     from bot.services import publication
 
-    publication._last_displayed_counts.clear()
+    publication._last_displayed_states.clear()
 
     async def not_modified(*args, **kwargs):
         raise TelegramBadRequest("editMessageText", "Bad Request: message is not modified")
@@ -469,7 +482,7 @@ async def test_realtime_count_sync_on_join_ban_startup_and_burst_throttle(
     assert all("已报名：2 人" in text for _, _, text, _ in bot.edited[-2:])
 
     # 4. Restart recovery refreshes existing running giveaways immediately without waiting 5m
-    publication._last_displayed_counts.clear()
+    publication._last_displayed_states.clear()
     scheduler = GiveawayScheduler(bot)
     await scheduler.restore_from_db()
     assert len(bot.edited) == 8

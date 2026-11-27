@@ -59,6 +59,7 @@ _LIGHTWEIGHT_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("giveaways", "publishing", "BOOLEAN DEFAULT 0"),
     ("poetry_attempts", "expires_at", "DATETIME"),
     ("poetry_attempts", "sent_at", "DATETIME"),
+    ("prize_codes", "withdrawn_at", "DATETIME"),
 )
 
 

@@ -1,37 +1,43 @@
-🎁 <b>抽奖 #{{ id }}</b>
-
-<b>{{ title }}</b>
+<b>🎁 {{ title }}</b>
+抽奖 #{{ id }}{{ " · 已开奖" if finished else "" }}
 
 {% if description %}
 {{ description }}
 
 {% endif %}
-🏆 奖品:
+<b>🏆 奖项与领取</b>
 {% for tier in prizes %}
-• {{ tier.name }} × {{ tier.count }}
+• {{ tier.name }} · {{ tier.count }} 个名额
 {% endfor %}
+{% if prize_mode == "unique" %}
+领取方式：一人一码，中奖后到机器人私聊领取。
+{% elif prize_mode == "shared" %}
+领取方式：共同领取，所有中奖者在私聊领取同一份内容。
+{% else %}
+领取方式：中奖后由主办方联系发奖。
+{% endif %}
+{{ claim_notice }}
 
+{% if not finished %}
+<b>📝 如何参加</b>
 {% if channels %}
-📢 必加频道:
-{% for ch in channels %}
-• {{ ch }}
-{% endfor %}
-
+必加频道：{{ channels | join("、") }}
 {% endif %}
 {% if groups %}
-👥 必加群组:
-{% for group in groups %}
-• {{ group }}
-{% endfor %}
-频道和群组均需加入后才能报名。
+必加群组：{{ groups | join("、") }}
+{% endif %}
+加入上方所有地点后，私聊机器人发送 /start，再点「参加」完成古诗词答题。
+每题限时 60 秒，超时计错，每场最多可错 5 次。
 
 {% endif %}
-📝 参加须答对一道古诗词选择题，每题限时60秒，超时计错；每人每场最多答错五次。
-请先私聊机器人发送 /start，再点击「参加」接收题目。
-
-🏁 开奖条件：{{ ends_at }}
-👥 已报名：{{ count }} 人
+<b>🏁 开奖信息</b>
+开奖条件：{{ ends_at }}
+已报名：{{ count }} 人
+{% if finished %}
+私聊机器人发送 <code>/result {{ id }}</code> 查询中奖结果。
+{% endif %}
 {% if commit %}
-🔐 可验证开奖，开奖前先公布承诺：
-种子承诺 = <code>{{ commit }}</code>
+
+<b>🔐 开奖承诺</b>
+<code>{{ commit }}</code>
 {% endif %}

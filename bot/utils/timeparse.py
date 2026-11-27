@@ -47,14 +47,14 @@ def parse_end_at(text: str, tz_name: str = "UTC") -> datetime | None:
     return None
 
 
-def format_local(dt: datetime, tz_name: str = "UTC") -> str:
+def format_local(dt: datetime, tz_name: str = "UTC", *, seconds: bool = False) -> str:
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = timezone.utc
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M")
 
 
 def parse_prizes(text: str) -> list[dict] | None:

@@ -27,6 +27,7 @@ from bot.db.repo import (
 )
 from bot.handlers import participate
 from bot.main import _configure_delivery
+from bot.prize_policy import CLAIM_WINDOW
 from bot.services import giveaway as gw_service
 from bot.services.channels import missing_channels, validate_channels
 from bot.services.notifier import retry_pending, winner_delivery_lock
@@ -63,7 +64,7 @@ async def test_concurrent_draws_produce_one_result(sessionmaker, due_giveaway, b
     assert len([m for m in bot.sent if m[0] == 1001]) == 1
 
 
-async def test_long_winner_announcement_is_split_without_losing_winners(
+async def test_large_draw_sends_one_public_summary_and_each_winner_a_dm(
     sessionmaker, due_giveaway, bot
 ):
     tier_a = "奖" * 64
@@ -84,22 +85,25 @@ async def test_long_winner_announcement_is_split_without_losing_winners(
     await gw_service.finalize_and_publish(gid, bot)
 
     public_posts = [(message, args) for chat, message, args in bot.sent if chat == -100123]
-    assert len(public_posts) == 3
-    for message, args in public_posts:
-        assert telegram_text_length(message) <= 4096
-        assert args["reply_to_message_id"] == 7
-        assert message.count("<blockquote expandable>") == 1
-        assert message.count("</blockquote>") == 1
-        assert message.count('tg://user?id=') <= 90
-    announcement = "\n".join(message for message, _ in public_posts)
-    assert all(announcement.count(f'tg://user?id={user_id}"') == 1 for user_id in members)
+    assert len(public_posts) == 1
+    message, args = public_posts[0]
+    assert telegram_text_length(message) < 512
+    assert args["reply_to_message_id"] == 7
+    assert "本轮中奖人数：260 人" in message
+    assert f"/result {gid}" in message
+    assert "tg://user?id=" not in message
+    assert sorted(chat for chat, _, _ in bot.sent if chat > 0) == members
 
 
-async def test_seventy_winners_collapse_into_one_expandable_blockquote(
+async def test_public_summary_keeps_seed_proof_without_winner_mentions(
     sessionmaker, due_giveaway, bot
 ):
     members = range(1001, 1071)
-    gid = await due_giveaway(prize_tiers=[{"name": "一等奖", "count": len(members)}])
+    gid = await due_giveaway(
+        prize_tiers=[{"name": "一等奖", "count": len(members)}],
+        draw_seed="secret-seed",
+        draw_commit="seed-hash",
+    )
     async with sessionmaker() as session:
         for user_id in members:
             await add_participant(session, giveaway_id=gid, user_id=user_id, username=None)
@@ -114,8 +118,9 @@ async def test_seventy_winners_collapse_into_one_expandable_blockquote(
     assert args["reply_to_message_id"] == 9
     assert telegram_text_length(message) <= 4096
     assert "<blockquote expandable>" in message and "</blockquote>" in message
-    assert "共 70 人" in message
-    assert all(message.count(f'tg://user?id={user_id}"') == 1 for user_id in members)
+    assert "secret-seed" in message
+    assert "本轮中奖人数：70 人" in message
+    assert "tg://user?id=" not in message
 
 
 async def test_winner_dm_retries_after_telegram_flood_limit(
@@ -191,7 +196,7 @@ async def test_required_channel_needs_bot_admin_permissions(bot):
 
 
 async def test_failed_winner_dm_can_be_retried(sessionmaker, due_giveaway, bot):
-    gid = await due_giveaway()
+    gid = await due_giveaway(prize_mode="unique")
     async with sessionmaker() as session:
         await add_participant(session, giveaway_id=gid, user_id=1001, username="winner")
         await session.commit()
@@ -201,9 +206,23 @@ async def test_failed_winner_dm_can_be_retried(sessionmaker, due_giveaway, bot):
         assert len(await pending_notifications(session, gid)) == 1
     bot.fail_for.clear()
     assert await retry_pending(bot, gid) == 1
+    assert "48 小时" in bot.sent[-1][1] and "领奖截止" in bot.sent[-1][1]
     assert await retry_pending(bot, gid) == 0
     async with sessionmaker() as session:
         assert not await pending_notifications(session, gid)
+
+
+async def test_retry_skips_expired_winner_dm(sessionmaker, due_giveaway, bot):
+    gid = await due_giveaway(prize_mode="unique")
+    async with sessionmaker() as session:
+        giveaway = await get_giveaway(session, gid)
+        giveaway.status = GiveawayStatus.finished
+        expired, current = await log_winners(session, gid, [(1001, "Steam card"), (1002, "Steam card")])
+        expired.drawn_at -= CLAIM_WINDOW
+        await session.commit()
+        assert [row.id for row in await pending_notifications(session, gid)] == [current.id]
+    assert await retry_pending(bot, gid) == 1
+    assert [chat for chat, _, _ in bot.sent] == [1002]
 
 
 async def test_retry_waits_for_initial_winner_dm(sessionmaker, due_giveaway, bot, monkeypatch):

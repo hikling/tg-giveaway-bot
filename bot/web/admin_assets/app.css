@@ -877,6 +877,12 @@ textarea { resize: vertical; }
 /* Parsed Chips & Saved Location Picker */
 .parsed-chips, .pick-grid { display: flex; flex-wrap: wrap; gap: 6px; }
 .saved-picks { display: grid; gap: 6px; }
+.saved-picks-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+.saved-pick-item { display: flex; align-items: center; gap: 4px; max-width: 100%; }
+.saved-pick-item .pick-pill { min-width: 0; overflow-wrap: anywhere; }
+.saved-pick-label { display: grid; min-width: 0; text-align: start; }
+.saved-pick-reference { font-size: .75rem; font-weight: 400; }
+.saved-picks .saved-pick-remove { flex: none; min-height: 44px; }
 .pick-pill {
     display: inline-flex;
     align-items: center;
@@ -967,13 +973,12 @@ textarea { resize: vertical; }
     border-radius: 14px 14px 14px 4px;
     background: var(--tg-bubble);
     box-shadow: var(--shadow-sm);
-    display: grid;
-    gap: 8px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     font-size: .92rem;
     line-height: 1.5;
 }
-.tg-bubble-title { font-size: 1rem; font-weight: 700; }
-.tg-bubble-section { display: grid; gap: 3px; }
+.tg-bubble a { color: var(--brand-ink); }
 .tg-inline-btn {
     display: flex;
     align-items: center;
@@ -1018,6 +1023,7 @@ dialog form { display: grid; gap: 14px; }
     .panel { padding: 20px; }
     .hero { padding: 22px 24px; }
     .choice-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .choice-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .builder-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .detail-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
